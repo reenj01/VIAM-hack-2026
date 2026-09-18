@@ -148,12 +148,89 @@ def decode_color_frame(images):
     return None
 
 
-async def grab_frame(cam: Camera, frame_w: Optional[int] = None, frame_h: Optional[int] = None):
-    images, _ = await cam.get_images()
-    frame = decode_color_frame(images)
-    if frame is not None and frame_w is not None and frame.shape[1::-1] != (frame_w, frame_h):
-        frame = cv2.resize(frame, (frame_w, frame_h))
-    return frame
+COLOR_SOURCE_NAME = "color"   # only fetch this from get_images(); the raw depth frame is ~1.8 MB
+
+
+class RobotFeed:
+    """Pulls camera frames and detections in background tasks, each at its own
+    pace, so the UI loop runs at webcam rate instead of blocking on a network
+    round trip plus a YOLO inference for every frame it draws."""
+
+    def __init__(self, cam: Camera, detector: VisionClient):
+        self.cam, self.detector = cam, detector
+        self.frame: Optional[np.ndarray] = None
+        self.boxes: list[Box] = []
+        self.frame_w = self.frame_h = 0
+        self.paused = False
+        self.frame_fps = 0.0
+        self.detect_ms = 0.0
+        self._boxes_at = 0.0
+        self._tasks: list[asyncio.Task] = []
+
+    async def fetch_frame(self) -> Optional[np.ndarray]:
+        try:
+            images, _ = await self.cam.get_images(filter_source_names=[COLOR_SOURCE_NAME])
+        except Exception:
+            images = []
+        if not images:
+            images, _ = await self.cam.get_images()
+        frame = decode_color_frame(images)
+        if frame is not None and self.frame_w and frame.shape[1::-1] != (self.frame_w, self.frame_h):
+            frame = cv2.resize(frame, (self.frame_w, self.frame_h))
+        return frame
+
+    async def first_frame(self) -> tuple[int, int]:
+        frame = await self.fetch_frame()
+        if frame is None:
+            raise RuntimeError(f"Could not get a color frame from camera '{CAMERA_NAME}'")
+        self.frame_h, self.frame_w = frame.shape[:2]
+        self.frame = frame
+        return self.frame_w, self.frame_h
+
+    def start(self) -> None:
+        self._tasks = [asyncio.create_task(self._frame_loop()), asyncio.create_task(self._detect_loop())]
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    @property
+    def boxes_age_s(self) -> float:
+        return time.monotonic() - self._boxes_at if self._boxes_at else 0.0
+
+    async def _frame_loop(self) -> None:
+        last = time.monotonic()
+        while True:
+            if self.paused:
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                frame = await self.fetch_frame()
+                if frame is not None:
+                    self.frame = frame
+                    now = time.monotonic()
+                    self.frame_fps = 0.8 * self.frame_fps + 0.2 / max(1e-3, now - last)
+                    last = now
+            except Exception as e:
+                print(f"[feed] camera error: {e}")
+                await asyncio.sleep(0.5)
+
+    async def _detect_loop(self) -> None:
+        while True:
+            if self.paused:
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                t0 = time.monotonic()
+                dets = await self.detector.get_detections_from_camera(CAMERA_NAME)
+                self.detect_ms = (time.monotonic() - t0) * 1000
+                self.boxes = filter_background_boxes(
+                    [box_from_detection(d, i, self.frame_w, self.frame_h) for i, d in enumerate(dets)])
+                self._boxes_at = time.monotonic()
+            except Exception as e:
+                print(f"[feed] detector error: {e}")
+                await asyncio.sleep(0.5)
 
 
 def box_from_detection(det, index: int, frame_w: int, frame_h: int) -> Box:
@@ -374,21 +451,23 @@ async def main():
     gaze = WebcamGazeTracker(camera_index=WEBCAM_INDEX)
     smoother = GazeSmoother()
     lock = GazeLockController()
+    feed = RobotFeed(cam, detector)
     job: Optional[GraspJob] = None
 
     try:
-        frame = await grab_frame(cam)
-        if frame is None:
-            raise RuntimeError(f"Could not get a color frame from camera '{CAMERA_NAME}'")
-        frame_h, frame_w = frame.shape[:2]
+        frame_w, frame_h = await feed.first_frame()
 
         # Calibrate in the same AUTOSIZE window the live loop uses, so the gaze
-        # mapping is to the exact screen position the feed is shown at.
+        # mapping is to the exact screen position the feed is shown at. The
+        # background fetching starts afterwards: calibration blocks the event
+        # loop for ~25 s and shouldn't leave robot calls hanging mid-flight.
         cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
         calib = load_or_calibrate(gaze, frame_w, frame_h)
+        feed.start()
 
         while True:
             if lock.is_locked:
+                feed.paused = True  # don't compete with segmentation/planning for the machine's CPU
                 lines = [job.status] if job else []
                 lines.append("Q quit" + ("  |  R release" if job and job.done else "  |  grasp in progress..."))
                 cv2.imshow(WINDOW, draw_locked(lock.locked, lines))
@@ -402,17 +481,15 @@ async def main():
                         job = None
                 await asyncio.sleep(0.03)  # let the grasp task run
                 continue
+            feed.paused = False
 
-            frame = await grab_frame(cam, frame_w, frame_h)
-            if frame is None:
-                continue
-            detections = await detector.get_detections_from_camera(CAMERA_NAME)
-            boxes = filter_background_boxes(
-                [box_from_detection(d, i, frame_w, frame_h) for i, d in enumerate(detections)])
-
-            gaze_pt, ear = estimate_gaze(gaze, calib, smoother)
+            frame, boxes = feed.frame, feed.boxes
+            # Webcam read + MediaPipe take ~30 ms; run them off the event loop so
+            # the feed tasks keep receiving data meanwhile.
+            gaze_pt, ear = await asyncio.to_thread(estimate_gaze, gaze, calib, smoother)
             hovered, progress, locked = lock.update(frame, boxes, gaze_pt)
             if locked is not None:
+                feed.paused = True
                 print(f"[lock] locked onto '{locked.box.label}' (index {locked.box.index})")
                 job = GraspJob()
                 job.task = asyncio.create_task(run_grasp(segmenter, motion, gripper, arm, locked.box, job))
@@ -425,14 +502,20 @@ async def main():
             elif ear is not None and ear < BLINK_EAR_THRESHOLD:
                 cv2.putText(view, "BLINK", (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            hud = (f"camera {feed.frame_fps:.0f} fps | detector {feed.detect_ms:.0f} ms "
+                   f"({feed.boxes_age_s:.1f}s old) | {len(boxes)} boxes")
+            cv2.putText(view, hud, (16, frame_h - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.imshow(WINDOW, view)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("c"):
+                feed.paused = True
                 calib = run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True)
                 smoother.reset()
     finally:
+        await feed.stop()
         if job is not None and job.task is not None and not job.task.done():
             print("[main] waiting for the in-progress grasp to finish before exiting...")
             await job.task

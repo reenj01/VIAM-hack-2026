@@ -52,7 +52,7 @@ CAMERA_HEIGHT = 720
 
 BLINK_EAR_THRESHOLD = 0.17
 DWELL_SECONDS = 0.9
-DWELL_GRACE_SECONDS = 0.25   # a brief gaze wobble outside the box doesn't reset the dwell
+DWELL_GRACE_SECONDS = 0.35   # a brief gaze wobble outside the box doesn't reset the dwell
 SMOOTHING = 0.80             # EMA weight on the previous gaze point (same as gaze_dot.py)
 
 CALIBRATION_TARGETS = [
