@@ -15,3 +15,7 @@ face_landmarker.task
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Per-user gaze calibration (meaningless for anyone but the person who ran it)
+gaze_calibration.json
+webcam_gaze_calibration.json

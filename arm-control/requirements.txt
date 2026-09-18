@@ -1,0 +1,4 @@
+viam-sdk==0.80.0
+opencv-contrib-python==5.0.0.93
+numpy==2.5.3
+mediapipe==1.0.1
