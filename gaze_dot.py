@@ -20,7 +20,7 @@ import numpy as np
 
 WINDOW_NAME = "Gaze dot prototype"
 MODEL_PATH = Path(__file__).with_name("face_landmarker.task")
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CALIBRATION_SECONDS = 1.5
@@ -184,7 +184,11 @@ def main() -> None:
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     if not camera.isOpened():
-        raise RuntimeError("Could not open webcam. Try CAMERA_INDEX = 1 in gaze_dot.py.")
+        raise RuntimeError(
+            f"Could not open webcam at CAMERA_INDEX = {CAMERA_INDEX}. Try a different index "
+            "(0 is usually the built-in camera), and check System Settings > Privacy & "
+            "Security > Camera to confirm this terminal has camera access."
+        )
 
     options = mp.tasks.vision.FaceLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(
@@ -215,11 +219,21 @@ def main() -> None:
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     print("Press C to start calibration. Press Q or Escape to quit.")
 
+    consecutive_read_failures = 0
     with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
         while True:
             ok, frame = camera.read()
             if not ok:
-                raise RuntimeError("Could not read a frame from the webcam.")
+                # AVFoundation on Apple Silicon occasionally drops a single frame --
+                # not fatal on its own, only bail out if it keeps happening.
+                consecutive_read_failures += 1
+                if consecutive_read_failures > 30:
+                    raise RuntimeError(
+                        "Webcam stopped returning frames. Check that no other app "
+                        "(Zoom, FaceTime, Photo Booth) has taken the camera."
+                    )
+                continue
+            consecutive_read_failures = 0
 
             frame = cv2.flip(frame, 1)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
