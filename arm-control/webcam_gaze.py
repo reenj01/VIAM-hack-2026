@@ -1,16 +1,18 @@
 """Reusable webcam gaze tracker.
 
-The feature extraction and calibration math here are ported directly from
-github/gaze_dot.py, which the team tested and found accurate. This module
-wraps that same algorithm in a class so it can be driven frame-by-frame from
-main.py's loop, and adds dwell-based selection + blink detection on top
-(gaze_dot.py itself only draws a cursor dot; it has no selection logic).
+The feature extraction, calibration math, and the face-framing gate are ported
+directly from gaze_dot.py at the repo root, which the team tested and found
+accurate. This module wraps that same algorithm in a class so it can be
+driven frame-by-frame from another program's loop, and adds gaze smoothing,
+blink detection, and dwell timing on top (gaze_dot.py only draws a cursor
+dot; it has no selection logic).
 
 Unlike gaze_dot.py's standalone script, calibration here targets the pixel
 space of whatever window you tell it to calibrate against (e.g. the window
-showing the RealSense feed), not the full OS screen -- so gaze coordinates
-land directly in the same pixel space as the video you're hit-testing
-against, with no extra screen-to-window remapping step.
+showing the RealSense feed), so gaze coordinates land directly in the same
+pixel space as the video you're hit-testing against. Calibrate and run in the
+SAME window, at the same screen position: the mapping is to pixels on your
+physical screen, so moving the window afterwards shifts everything.
 
 No training on an eye dataset happens here or in gaze_dot.py: the MediaPipe
 face/iris model is pretrained, and calibration is a small per-user ridge
@@ -46,6 +48,34 @@ LEFT_LID = (386, 374)
 
 BLINK_EAR_THRESHOLD = 0.17
 DWELL_SECONDS = 0.9
+DWELL_GRACE_SECONDS = 0.25   # a brief gaze wobble outside the box doesn't reset the dwell
+SMOOTHING = 0.80             # EMA weight on the previous gaze point (same as gaze_dot.py)
+
+CALIBRATION_TARGETS = [
+    (0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
+    (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
+    (0.15, 0.85), (0.50, 0.85), (0.85, 0.85),
+]
+
+# ID-photo-style framing gate, run once before the 9-point calibration starts
+# (from gaze_dot.py). Keeps the face centered and at a consistent distance so
+# the calibration is taken from the same head position it will be used from.
+FRAME_TARGET_CX = 0.50
+FRAME_TARGET_CY = 0.45
+FRAME_TARGET_W = 0.34
+FRAME_TARGET_H = 0.62
+FRAME_POSITION_TOLERANCE = 0.05
+FRAME_SIZE_RATIO_LOW = 0.85
+FRAME_SIZE_RATIO_HIGH = 1.20
+FRAME_HOLD_SECONDS = 1.0
+FRAME_MESSAGES = {
+    "move_left": "Move left to center your face in the frame",
+    "move_right": "Move right to center your face in the frame",
+    "move_up": "Move up to center your face in the frame",
+    "move_down": "Move down to center your face in the frame",
+    "move_closer": "Move closer to the camera",
+    "move_back": "Move back from the camera",
+}
 
 
 def _landmark_xy(landmarks, index: int) -> np.ndarray:
@@ -54,7 +84,7 @@ def _landmark_xy(landmarks, index: int) -> np.ndarray:
 
 
 def gaze_features(landmarks) -> Optional[np.ndarray]:
-    """Same feature vector as github/gaze_dot.py's gaze_features()."""
+    """Same feature vector as gaze_dot.py's gaze_features()."""
     try:
         left_iris = np.mean([_landmark_xy(landmarks, i) for i in LEFT_IRIS], axis=0)
         right_iris = np.mean([_landmark_xy(landmarks, i) for i in RIGHT_IRIS], axis=0)
@@ -104,11 +134,69 @@ def eye_aspect_ratio(landmarks) -> float:
 
 
 def fit_calibration(samples: list[np.ndarray], targets_px: list[np.ndarray]) -> np.ndarray:
-    """Same ridge-regularized fit as github/gaze_dot.py's fit_calibration()."""
+    """Same ridge-regularized fit as gaze_dot.py's fit_calibration()."""
     x = np.vstack(samples)
     y = np.vstack(targets_px)
     regularization = 1e-3
     return np.linalg.solve(x.T @ x + regularization * np.eye(x.shape[1]), x.T @ y)
+
+
+def calibration_error(samples, targets_px, mapping) -> float:
+    """Mean pixel error on the calibration points themselves."""
+    pred = np.vstack(samples) @ mapping
+    return float(np.mean(np.linalg.norm(pred - np.vstack(targets_px), axis=1)))
+
+
+def face_bbox_normalized(landmarks) -> tuple[float, float, float, float]:
+    """Bounding box (left, top, right, bottom) of all face landmarks, normalized [0, 1]."""
+    xs = np.array([p.x for p in landmarks])
+    ys = np.array([p.y for p in landmarks])
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
+def evaluate_framing(bbox) -> tuple[str, bool]:
+    """Compare the face bbox to the target oval and return (status_code, aligned)."""
+    left, top, right, bottom = bbox
+    face_cx = (left + right) / 2
+    face_cy = (top + bottom) / 2
+    face_h = bottom - top
+
+    dx = face_cx - FRAME_TARGET_CX
+    dy = face_cy - FRAME_TARGET_CY
+    size_ratio = face_h / FRAME_TARGET_H
+
+    # The frame is mirrored (selfie view), so on-screen directions read like a
+    # real mirror: face right-of-center on screen -> tell the user to move left.
+    if abs(dx) > FRAME_POSITION_TOLERANCE:
+        return ("move_left" if dx > 0 else "move_right"), False
+    if abs(dy) > FRAME_POSITION_TOLERANCE:
+        return ("move_up" if dy > 0 else "move_down"), False
+    if size_ratio < FRAME_SIZE_RATIO_LOW:
+        return "move_closer", False
+    if size_ratio > FRAME_SIZE_RATIO_HIGH:
+        return "move_back", False
+    return "aligned", True
+
+
+def draw_id_frame(canvas, aligned: bool) -> None:
+    height, width = canvas.shape[:2]
+    center = (int(FRAME_TARGET_CX * width), int(FRAME_TARGET_CY * height))
+    axes = (int(FRAME_TARGET_W * width / 2), int(FRAME_TARGET_H * height / 2))
+    color = (0, 200, 0) if aligned else (0, 165, 255)
+    cv2.ellipse(canvas, center, axes, 0, 0, 360, color, 3)
+
+
+def _draw_status(canvas, message: str) -> None:
+    cv2.rectangle(canvas, (10, 10), (min(canvas.shape[1] - 10, 900), 75), (0, 0, 0), -1)
+    cv2.putText(canvas, message, (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+
+def _draw_target(canvas, point_px, number: int, progress: float, settling: bool) -> None:
+    x, y = point_px
+    color = (0, 165, 255) if settling else (0, 255, 255)
+    cv2.circle(canvas, (x, y), 24, color, 3)
+    cv2.circle(canvas, (x, y), max(1, int(20 * progress)), color, -1)
+    cv2.putText(canvas, str(number), (x - 8, y + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
 
 @dataclass
@@ -193,67 +281,150 @@ class WebcamGazeTracker:
         self._landmarker.close()
 
 
+class GazeSmoother:
+    """Exponential moving average over the predicted gaze point."""
+
+    def __init__(self, smoothing: float = SMOOTHING):
+        self.smoothing = smoothing
+        self._pt: Optional[np.ndarray] = None
+
+    def reset(self) -> None:
+        self._pt = None
+
+    def update(self, pt: tuple[float, float]) -> tuple[float, float]:
+        p = np.array(pt, dtype=np.float64)
+        self._pt = p if self._pt is None else self.smoothing * self._pt + (1 - self.smoothing) * p
+        return float(self._pt[0]), float(self._pt[1])
+
+
+def estimate_gaze(tracker: WebcamGazeTracker, calib: GazeCalibration,
+                  smoother: GazeSmoother) -> tuple[Optional[tuple[float, float]], Optional[float]]:
+    """One webcam frame -> (smoothed gaze point in window pixels or None, eye aspect ratio)."""
+    _, _, feats, ear = tracker.read()
+    if feats is None:
+        smoother.reset()
+        return None, ear
+    return smoother.update(calib.predict(feats)), ear
+
+
+class DwellSelector:
+    """Tracks how long gaze has continuously hovered the same label."""
+
+    def __init__(self, dwell_seconds: float = DWELL_SECONDS,
+                 grace_seconds: float = DWELL_GRACE_SECONDS):
+        self.dwell_seconds = dwell_seconds
+        self.grace_seconds = grace_seconds
+        self._target: Optional[str] = None
+        self._started_at: Optional[float] = None
+        self._last_seen: Optional[float] = None
+
+    def reset(self) -> None:
+        self._target, self._started_at, self._last_seen = None, None, None
+
+    def update(self, hovered: Optional[str]) -> tuple[Optional[str], float]:
+        """Returns (selected_label_or_None, progress_0_to_1)."""
+        now = time.monotonic()
+        if hovered is None:
+            if self._target is not None and now - self._last_seen <= self.grace_seconds:
+                return None, min(1.0, (now - self._started_at) / self.dwell_seconds)
+            self.reset()
+            return None, 0.0
+        if hovered != self._target:
+            self._target, self._started_at, self._last_seen = hovered, now, now
+            return None, 0.0
+        self._last_seen = now
+        elapsed = now - self._started_at
+        if elapsed >= self.dwell_seconds:
+            return hovered, 1.0
+        return None, elapsed / self.dwell_seconds
+
+
 def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                      window_name: str = "Gaze Calibration",
-                     samples_per_point: int = 20,
                      settle_seconds: float = 0.5,
-                     hold_seconds: float = 1.5) -> GazeCalibration:
-    """9-point calibration against a window of size (frame_w, frame_h).
+                     hold_seconds: float = 1.5,
+                     min_samples_per_point: int = 10,
+                     keep_window: bool = False) -> GazeCalibration:
+    """Framing gate, then 9-point calibration, against a window of size (frame_w, frame_h).
 
-    Same target layout and per-point timing as github/gaze_dot.py, but driven
-    automatically by a hold duration rather than a SPACE keypress, and scaled
-    to an arbitrary window size rather than the full screen.
+    Same flow and timing as gaze_dot.py: center your face in the oval, hold
+    for a second, then each target is shown for settle + hold seconds and the
+    median of the samples collected after the settle window is kept.
+    Pass keep_window=True to leave the window open for the caller to reuse
+    (so the run happens at the exact screen position that was calibrated).
     """
-    targets = [
-        (0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
-        (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
-        (0.15, 0.85), (0.50, 0.85), (0.85, 0.85),
-    ]
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, frame_w, frame_h)
+    def finish_window():
+        if not keep_window:
+            cv2.destroyWindow(window_name)
 
+    def show(canvas):
+        cv2.imshow(window_name, canvas)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            finish_window()
+            raise SystemExit("Calibration cancelled")
+
+    def webcam_canvas(frame):
+        if frame is None:
+            return np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+        return cv2.resize(frame, (frame_w, frame_h))
+
+    # Phase 1: framing gate.
+    hold_started = 0.0
+    while True:
+        frame, landmarks, _, _ = tracker.read()
+        canvas = webcam_canvas(frame)
+        now = time.monotonic()
+        if landmarks is None:
+            hold_started = 0.0
+            draw_id_frame(canvas, aligned=False)
+            _draw_status(canvas, "Face not found. Center your face in the frame.")
+        else:
+            status, aligned = evaluate_framing(face_bbox_normalized(landmarks))
+            draw_id_frame(canvas, aligned)
+            if aligned:
+                if hold_started == 0.0:
+                    hold_started = now
+                remaining = max(0.0, FRAME_HOLD_SECONDS - (now - hold_started))
+                _draw_status(canvas, "Hold still..." if remaining > 0 else "Starting calibration...")
+                if remaining <= 0.0:
+                    show(canvas)
+                    break
+            else:
+                hold_started = 0.0
+                _draw_status(canvas, FRAME_MESSAGES[status])
+        show(canvas)
+
+    # Phase 2: the nine targets.
     all_features: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
-
-    for idx, (tx, ty) in enumerate(targets):
+    for idx, (tx, ty) in enumerate(CALIBRATION_TARGETS):
         px, py = int(tx * frame_w), int(ty * frame_h)
-        target_samples: list[np.ndarray] = []
-        phase_start = time.monotonic()
-
+        samples: list[np.ndarray] = []
+        started = time.monotonic()
         while True:
-            frame, landmarks, feats, _ = tracker.read()
-            canvas = frame.copy() if frame is not None else np.zeros((frame_h, frame_w, 3), np.uint8)
-            canvas = cv2.resize(canvas, (frame_w, frame_h))
-
-            elapsed = time.monotonic() - phase_start
+            frame, _, feats, _ = tracker.read()
+            canvas = webcam_canvas(frame)
+            elapsed = time.monotonic() - started
             settling = elapsed < settle_seconds
             progress = min(elapsed / (hold_seconds + settle_seconds), 1.0)
-            color = (0, 165, 255) if settling else (0, 255, 255)
-            cv2.circle(canvas, (px, py), 24, color, 3)
-            cv2.circle(canvas, (px, py), max(1, int(20 * progress)), color, -1)
-            cv2.putText(canvas, f"Target {idx + 1}/{len(targets)} - look at the dot",
-                        (25, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
+            _draw_target(canvas, (px, py), idx + 1, progress, settling)
+            _draw_status(canvas, f"Look directly at target {idx + 1} of {len(CALIBRATION_TARGETS)}")
             if feats is not None and not settling:
-                target_samples.append(feats)
-
-            cv2.imshow(window_name, canvas)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), 27):
-                cv2.destroyWindow(window_name)
-                raise SystemExit("Calibration cancelled")
-
+                samples.append(feats)
+            show(canvas)
             if elapsed >= hold_seconds + settle_seconds:
                 break
 
-        if len(target_samples) >= min(10, samples_per_point // 2):
-            all_features.append(np.median(target_samples, axis=0))
+        if len(samples) >= min_samples_per_point:
+            all_features.append(np.median(samples, axis=0))
             all_targets.append(np.array([px, py], dtype=np.float64))
         else:
             print(f"[calibration] target {idx + 1} skipped: face not tracked reliably")
 
-    cv2.destroyWindow(window_name)
+    finish_window()
 
     if len(all_features) < 6:
         raise RuntimeError("Too few good calibration points captured; try again with better lighting.")
@@ -261,28 +432,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
     mapping = fit_calibration(all_features, all_targets)
     calib = GazeCalibration(mapping=mapping, frame_w=frame_w, frame_h=frame_h)
     calib.save()
-    print(f"[calibration] done ({len(all_features)}/{len(targets)} points), saved to {CALIBRATION_PATH}")
+    err = calibration_error(all_features, all_targets, mapping)
+    print(f"[calibration] done on {len(all_features)}/{len(CALIBRATION_TARGETS)} points, "
+          f"mean fit error {err:.1f}px, saved to {CALIBRATION_PATH}")
     return calib
-
-
-class DwellSelector:
-    """Tracks how long gaze has continuously hovered the same label."""
-
-    def __init__(self, dwell_seconds: float = DWELL_SECONDS):
-        self.dwell_seconds = dwell_seconds
-        self._target: Optional[str] = None
-        self._started_at: Optional[float] = None
-
-    def update(self, hovered: Optional[str]) -> tuple[Optional[str], float]:
-        """Returns (selected_label_or_None, progress_0_to_1)."""
-        if hovered is None:
-            self._target, self._started_at = None, None
-            return None, 0.0
-        if hovered != self._target:
-            self._target, self._started_at = hovered, time.monotonic()
-            return None, 0.0
-        elapsed = time.monotonic() - self._started_at
-        progress = min(1.0, elapsed / self.dwell_seconds)
-        if elapsed >= self.dwell_seconds:
-            return hovered, 1.0
-        return None, progress
