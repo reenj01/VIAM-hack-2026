@@ -10,6 +10,7 @@ Keys: Q quit, R release the lock once the grasp attempt has finished.
 
 import asyncio
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -76,13 +77,28 @@ MOTION_REFERENCE_FRAME = "world"
 # rotation about it in degrees. (0, 0, -1, 0) points the gripper straight down.
 DEFAULT_GRASP_ORIENTATION = dict(o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0)
 
+# The gripper's frame sits 105 mm out from the end of the arm (crash course,
+# "Frames"), so moving the *gripper* to a pose puts the finger center there.
 APPROACH_HEIGHT_MM = 100.0
-GRASP_Z_OFFSET_MM = 0.0
+GRASP_Z_OFFSET_MM = 0.0        # + lifts the grasp point above the object's center
 GRIPPER_CLEARANCE_MM = 15.0
+
+# After a grasp attempt, lift back to the approach height and return to the
+# pose the gripper was at when the object was locked, so the camera sees the
+# table again for the next selection (the deck's arm-position-saver idea).
+RETURN_TO_START = True
+
+# Every hackathon machine has table + wall obstacles (erh:vmodutils:obstacle).
+# The motion service plans around them; direct arm moves (MoveToPosition /
+# MoveToJointPositions) go straight through them, so only ever move via motion.
 
 WEBCAM_INDEX = 0
 RELEASE_AFTER_SECONDS = 4.0   # show the grasp result on the frozen frame, then go live again
 WINDOW = "Gaze-selected pick (Q quit, R release lock)"
+
+# `python main.py --dry-run`: full gaze -> lock -> 3D pose flow, prints what it
+# would send to the motion service and gripper, moves nothing.
+DRY_RUN = "--dry-run" in sys.argv
 
 
 async def connect():
@@ -178,6 +194,24 @@ class GraspJob:
         return self.finished_at is not None
 
 
+async def move_to(motion: MotionClient, pose: Pose, label: str, job: GraspJob) -> bool:
+    prefix = "DRY RUN, would be " if DRY_RUN else ""
+    job.status = f"{prefix}moving to {label}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} mm"
+    print(f"[grab] {job.status}")
+    if DRY_RUN:
+        await asyncio.sleep(0.5)
+        return True
+    # viam-sdk 0.80.0: component_name is the component's plain name (proto string).
+    ok = await motion.move(
+        component_name=GRIPPER_NAME,
+        destination=PoseInFrame(reference_frame=MOTION_REFERENCE_FRAME, pose=pose),
+    )
+    if not ok:
+        job.status = f"motion.move() failed on {label}"
+        print(f"[grab] {job.status}")
+    return ok
+
+
 async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, job: GraspJob) -> bool:
     cs = object_center_and_size(point_cloud_obj)
     if cs is None:
@@ -188,19 +222,23 @@ async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, 
     grasp = Pose(x=center.x, y=center.y, z=center.z + GRASP_Z_OFFSET_MM, **DEFAULT_GRASP_ORIENTATION)
     approach = Pose(x=grasp.x, y=grasp.y, z=grasp.z + APPROACH_HEIGHT_MM, **DEFAULT_GRASP_ORIENTATION)
 
-    for label, pose in (("approach", approach), ("grasp", grasp)):
-        job.status = f"moving to {label}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} mm"
-        print(f"[grab] {job.status}")
-        # viam-sdk 0.80.0: component_name is the component's plain name (proto string).
-        ok = await motion.move(
-            component_name=GRIPPER_NAME,
-            destination=PoseInFrame(reference_frame=MOTION_REFERENCE_FRAME, pose=pose),
-        )
-        if not ok:
-            job.status = f"motion.move() failed on {label}"
-            return False
+    start = None
+    if RETURN_TO_START and not DRY_RUN:
+        start = (await motion.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME)).pose
+
+    if not await move_to(motion, approach, "approach", job):
+        return False
+    if not await move_to(motion, grasp, "grasp", job):
+        if start is not None:
+            await move_to(motion, start, "start (retreat)", job)
+        return False
 
     width = min((d for d in size[:2] if d > 0), default=0.0)
+    if DRY_RUN:
+        job.status = (f"DRY RUN: would close gripper to ~{max(0.0, width - GRIPPER_CLEARANCE_MM):.0f} mm "
+                      f"(object ~{width:.0f} mm wide)" if width > 0 else "DRY RUN: would call grab()")
+        print(f"[grab] {job.status}")
+        return True
     if width > 0:
         target_mm = max(0.0, width - GRIPPER_CLEARANCE_MM)
         job.status = f"object ~{width:.0f}mm wide, closing to {target_mm:.0f}mm"
@@ -217,7 +255,13 @@ async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, 
         await gripper.grab()
 
     job.holding = await gripper.is_holding_something()
-    job.status = f"grab complete, holding_something={job.holding}"
+    print(f"[grab] grab complete, holding_something={job.holding}")
+
+    if start is not None:
+        await move_to(motion, approach, "approach (lift)", job)
+        await move_to(motion, start, "start", job)
+
+    job.status = f"done, holding_something={job.holding}"
     print(f"[grab] {job.status}")
     return bool(job.holding)
 
@@ -241,6 +285,21 @@ async def run_grasp(segmenter: VisionClient, motion: MotionClient, gripper: Grip
         job.finished_at = time.monotonic()
 
 
+def resolve_motion_name(machine) -> str:
+    """Check the configured names against the machine; the built-in motion
+    service is usually named 'builtin', so fall back to that."""
+    have = {r.name for r in machine.resource_names}
+    missing = [n for n in (CAMERA_NAME, DETECTOR_NAME, SEGMENTER_NAME, GRIPPER_NAME) if n not in have]
+    if missing:
+        raise SystemExit(f"Not on this machine: {missing}. Resources found: {sorted(have)}. "
+                         "Fix the names at the top of main.py.")
+    for name in (MOTION_SERVICE_NAME, "builtin"):
+        if name in have:
+            return name
+    raise SystemExit(f"No motion service named '{MOTION_SERVICE_NAME}' or 'builtin'. "
+                     f"Resources found: {sorted(have)}")
+
+
 def load_or_calibrate(gaze: WebcamGazeTracker, frame_w: int, frame_h: int) -> GazeCalibration:
     if CALIBRATION_PATH.exists():
         calib = GazeCalibration.load()
@@ -253,10 +312,12 @@ def load_or_calibrate(gaze: WebcamGazeTracker, frame_w: int, frame_h: int) -> Ga
 
 async def main():
     machine = await connect()
+    motion_name = resolve_motion_name(machine)
+    print(f"[main] using motion service '{motion_name}'" + (" (DRY RUN: no movement)" if DRY_RUN else ""))
     cam = Camera.from_robot(machine, CAMERA_NAME)
     detector = VisionClient.from_robot(machine, DETECTOR_NAME)
     segmenter = VisionClient.from_robot(machine, SEGMENTER_NAME)
-    motion = MotionClient.from_robot(machine, MOTION_SERVICE_NAME)
+    motion = MotionClient.from_robot(machine, motion_name)
     gripper = Gripper.from_robot(machine, GRIPPER_NAME)
 
     gaze = WebcamGazeTracker(camera_index=WEBCAM_INDEX)
