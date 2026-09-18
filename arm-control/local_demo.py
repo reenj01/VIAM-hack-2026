@@ -20,7 +20,7 @@ from pathlib import Path
 
 import cv2
 
-from gaze_lock import Box, GazeLockController, draw_live, draw_locked
+from gaze_lock import Box, GazeLockController, draw_live, draw_locked, filter_background_boxes
 from webcam_gaze import (
     BLINK_EAR_THRESHOLD,
     CALIBRATION_PATH,
@@ -90,7 +90,7 @@ def detect(model, frame, conf: float) -> list[Box]:
     for i, (xyxy, c, k) in enumerate(rows):
         x0, y0, x1, y1 = (int(v) for v in xyxy)
         boxes.append(Box(x0, y0, x1, y1, result.names[int(k)], float(c), i))
-    return boxes
+    return filter_background_boxes(boxes)
 
 
 def main():

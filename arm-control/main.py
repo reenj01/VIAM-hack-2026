@@ -9,7 +9,9 @@ Keys: Q quit, R release the lock once the grasp attempt has finished.
 """
 
 import asyncio
+import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -22,7 +24,7 @@ from viam.services.vision import VisionClient
 from viam.services.motion import MotionClient
 from viam.proto.common import Pose, PoseInFrame
 
-from gaze_lock import Box, GazeLockController, draw_live, draw_locked
+from gaze_lock import Box, GazeLockController, draw_live, draw_locked, filter_background_boxes
 from webcam_gaze import (
     BLINK_EAR_THRESHOLD,
     CALIBRATION_PATH,
@@ -33,9 +35,31 @@ from webcam_gaze import (
     run_calibration,
 )
 
-API_KEY = "<from Connect tab>"
-API_KEY_ID = "<from Connect tab>"
-ADDRESS = "<your-machine-address.viam.cloud>"
+HERE = Path(__file__).resolve().parent
+ENV_FILES = (HERE / ".env", HERE.parent / ".env")   # arm-control/.env, then the repo root
+
+
+def load_env() -> dict[str, str]:
+    """Credentials come from a gitignored .env (see ../.env.example), never from source."""
+    values: dict[str, str] = {}
+    for path in ENV_FILES:
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    for key in ("VIAM_MACHINE_ADDRESS", "VIAM_API_KEY", "VIAM_API_KEY_ID"):
+        values[key] = os.environ.get(key) or values.get(key, "")
+        if not values[key]:
+            raise SystemExit(
+                f"{key} is not set. Copy ../.env.example to {ENV_FILES[0]} and fill it in "
+                "(the file is gitignored, so it stays off GitHub)."
+            )
+    return values
+
 
 CAMERA_NAME = "cam"
 DETECTOR_NAME = "yolo-detector"      # viam-labs:vision:yolov8 (yolov8m)
@@ -62,15 +86,25 @@ WINDOW = "Gaze-selected pick (Q quit, R release lock)"
 
 
 async def connect():
-    opts = RobotClient.Options.with_api_key(api_key=API_KEY, api_key_id=API_KEY_ID)
-    return await RobotClient.at_address(ADDRESS, opts)
+    env = load_env()
+    opts = RobotClient.Options.with_api_key(api_key=env["VIAM_API_KEY"],
+                                            api_key_id=env["VIAM_API_KEY_ID"])
+    return await RobotClient.at_address(env["VIAM_MACHINE_ADDRESS"], opts)
 
 
 def decode_color_frame(images):
+    """First image from get_images() that decodes as a color picture.
+
+    viam-sdk 0.80.0 returns NamedImage(name, data, mime_type); the depth stream
+    is raw bytes that cv2 can't decode, so it's skipped either by name or by
+    failing to decode.
+    """
     for img in images:
-        if "depth" in img.source_name.lower():
+        if "depth" in img.name.lower():
             continue
-        return cv2.imdecode(np.frombuffer(img.data, np.uint8), cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np.frombuffer(img.data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            return frame
     return None
 
 
@@ -261,7 +295,8 @@ async def main():
             if frame is None:
                 continue
             detections = await detector.get_detections_from_camera(CAMERA_NAME)
-            boxes = [box_from_detection(d, i, frame_w, frame_h) for i, d in enumerate(detections)]
+            boxes = filter_background_boxes(
+                [box_from_detection(d, i, frame_w, frame_h) for i, d in enumerate(detections)])
 
             gaze_pt, ear = estimate_gaze(gaze, calib, smoother)
             hovered, progress, locked = lock.update(frame, boxes, gaze_pt)

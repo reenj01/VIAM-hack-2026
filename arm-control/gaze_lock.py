@@ -52,6 +52,38 @@ class Box:
         return self.x0 <= x <= self.x1 and self.y0 <= y <= self.y1
 
 
+# Surfaces YOLO reports as objects. They're never pick targets, and their boxes
+# swallow everything on them.
+IGNORE_LABELS = {"dining table", "bed", "couch", "bench"}
+ENGULF_FRACTION = 0.7        # this much of the smaller box lies inside the bigger one...
+ENGULF_MIN_AREA_RATIO = 3.0  # ...and the bigger box is at least this many times larger
+
+
+def overlap_fraction(outer: Box, inner: Box) -> float:
+    """Fraction of inner's area that lies inside outer."""
+    ix0, iy0 = max(outer.x0, inner.x0), max(outer.y0, inner.y0)
+    ix1, iy1 = min(outer.x1, inner.x1), min(outer.y1, inner.y1)
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    return inter / inner.area if inner.area else 0.0
+
+
+def engulfs(outer: Box, inner: Box) -> bool:
+    return (outer.area >= ENGULF_MIN_AREA_RATIO * inner.area
+            and overlap_fraction(outer, inner) >= ENGULF_FRACTION)
+
+
+def filter_background_boxes(boxes: Sequence[Box]) -> list[Box]:
+    """Drop denylisted labels and any box that engulfs a smaller box.
+
+    A much bigger box with another detection sitting inside it is the scene
+    (table, background), not a thing on it; ignoring it means gaze always
+    resolves to what's on top. Original indices are kept so 3D-object
+    matching still lines up.
+    """
+    kept = [b for b in boxes if b.label.lower() not in IGNORE_LABELS]
+    return [b for b in kept if not any(engulfs(b, o) for o in kept if o is not b)]
+
+
 @dataclass
 class LockedTarget:
     box: Box

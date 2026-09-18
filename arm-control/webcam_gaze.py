@@ -186,6 +186,17 @@ def draw_id_frame(canvas, aligned: bool) -> None:
     cv2.ellipse(canvas, center, axes, 0, 0, 360, color, 3)
 
 
+def letterbox(frame, width: int, height: int) -> np.ndarray:
+    """Fit frame inside width x height keeping its aspect ratio, black bars around."""
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    fh, fw = frame.shape[:2]
+    scale = min(width / fw, height / fh)
+    nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+    x, y = (width - nw) // 2, (height - nh) // 2
+    canvas[y:y + nh, x:x + nw] = cv2.resize(frame, (nw, nh))
+    return canvas
+
+
 def _draw_status(canvas, message: str) -> None:
     cv2.rectangle(canvas, (10, 10), (min(canvas.shape[1] - 10, 900), 75), (0, 0, 0), -1)
     cv2.putText(canvas, message, (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
@@ -369,33 +380,38 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
     def webcam_canvas(frame):
         if frame is None:
             return np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-        return cv2.resize(frame, (frame_w, frame_h))
+        return letterbox(frame, frame_w, frame_h)
 
     # Phase 1: framing gate.
     hold_started = 0.0
     while True:
         frame, landmarks, _, _ = tracker.read()
-        canvas = webcam_canvas(frame)
         now = time.monotonic()
+        aligned, remaining = False, 1.0
         if landmarks is None:
             hold_started = 0.0
-            draw_id_frame(canvas, aligned=False)
-            _draw_status(canvas, "Face not found. Center your face in the frame.")
+            message = "Face not found. Center your face in the frame."
         else:
             status, aligned = evaluate_framing(face_bbox_normalized(landmarks))
-            draw_id_frame(canvas, aligned)
             if aligned:
                 if hold_started == 0.0:
                     hold_started = now
                 remaining = max(0.0, FRAME_HOLD_SECONDS - (now - hold_started))
-                _draw_status(canvas, "Hold still..." if remaining > 0 else "Starting calibration...")
-                if remaining <= 0.0:
-                    show(canvas)
-                    break
+                message = "Hold still..." if remaining > 0 else "Starting calibration..."
             else:
                 hold_started = 0.0
-                _draw_status(canvas, FRAME_MESSAGES[status])
+                message = FRAME_MESSAGES[status]
+
+        # The oval goes on the raw webcam frame, so it sits in the same
+        # normalized space the face bbox is judged in, and is then letterboxed
+        # with the frame rather than stretched.
+        source = frame if frame is not None else np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+        draw_id_frame(source, aligned)
+        canvas = webcam_canvas(source)
+        _draw_status(canvas, message)
         show(canvas)
+        if aligned and remaining <= 0.0:
+            break
 
     # Phase 2: the nine targets.
     all_features: list[np.ndarray] = []
