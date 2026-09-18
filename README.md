@@ -25,6 +25,17 @@ Allow camera access if macOS asks.
 - `R`: recalibrate
 - `Q` or `Escape`: quit
 
+## Fullscreen Viam scene selection
+
+`viam_scene_select.py` reads one coherent snapshot (image, boxes, and 3D segments) from a configured Viam vision service. It displays the RealSense image fullscreen, calibrates gaze against that display, and highlights the detected box under the red dot. It never moves the robot.
+
+1. Copy `.env.example` to `.env` and fill in your Viam machine address, API key, API key ID, and component names.
+2. Manually put the arm at its safe observe pose and make sure it stays still.
+3. Run `python viam_scene_select.py`.
+4. Press `C` to calibrate, `N` to take a new snapshot before calibration, and `Q` to quit.
+
+Do not add `.env` to Git. It is ignored by default.
+
 ## Notes
 
 Keep the preview window at the same size and position used during calibration. Recalibrate after changing seating position, lighting, or display.

@@ -1,3 +1,5 @@
 mediapipe==0.10.35
 opencv-contrib-python==5.0.0.93
 numpy
+python-dotenv
+viam-sdk

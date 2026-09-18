@@ -152,6 +152,7 @@ def main() -> None:
     last_timestamp_ms = -1   # NEW: Tasks VIDEO mode requires strictly increasing stamps
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     print("Press C to start calibration. Press Q or Escape to quit.")
 
     with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
