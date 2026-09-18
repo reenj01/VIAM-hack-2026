@@ -5,7 +5,9 @@ locks that object (frozen snapshot, since the camera rides the arm) -> the
 segmenter deprojects it to a world-frame pose ONCE while the arm is still ->
 motion service moves the gripper there -> gripper closes.
 
-Keys: Q quit, R release the lock once the grasp attempt has finished.
+Keys: Q quit, R release the lock once the grasp attempt has finished, C recalibrate.
+Flags: --dry-run (no movement), --skip-calibration (reuse the last calibration),
+--detector NAME.
 """
 
 import asyncio
@@ -19,6 +21,7 @@ import cv2
 import numpy as np
 
 from viam.robot.client import RobotClient
+from viam.components.arm import Arm
 from viam.components.camera import Camera
 from viam.components.gripper import Gripper
 from viam.services.vision import VisionClient
@@ -63,10 +66,18 @@ def load_env() -> dict[str, str]:
 
 
 CAMERA_NAME = "cam"
-DETECTOR_NAME = "yolo-detector"      # viam-labs:vision:yolov8 (yolov8m)
+# Any vision service works here; they all return boxes + labels. objects-3d's
+# own `detector_name` attribute (Viam app config) must point at the same one,
+# or its 3D objects won't correspond to the boxes on screen.
+DETECTOR_CANDIDATES = ("yolo-detector", "shape-detector")   # viam-labs:yolov8, devrel:shape-finder
+DETECTOR_NAME = DETECTOR_CANDIDATES[0]
+if "--detector" in sys.argv:                               # python main.py --detector shape-detector
+    DETECTOR_NAME = sys.argv[sys.argv.index("--detector") + 1]
 SEGMENTER_NAME = "objects-3d"        # viam:vision:detections-to-segments
 MOTION_SERVICE_NAME = "motion"       # if this doesn't resolve, the SDK default name is "builtin"
 GRIPPER_NAME = "gripper"
+ARM_NAME = "arm"
+SEGMENTER_TIMEOUT_S = 60.0           # get_object_point_clouds can take several seconds
 
 # objects-3d transforms point clouds from the camera frame to the world frame,
 # so the poses it returns are already world-frame.
@@ -81,7 +92,14 @@ DEFAULT_GRASP_ORIENTATION = dict(o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0)
 # "Frames"), so moving the *gripper* to a pose puts the finger center there.
 APPROACH_HEIGHT_MM = 100.0
 GRASP_Z_OFFSET_MM = 0.0        # + lifts the grasp point above the object's center
-GRIPPER_CLEARANCE_MM = 15.0
+
+# Width-based close (so a paper cup isn't crushed): the uFactory gripper takes a
+# position on a 0-850 scale (850 = fully open, ~85 mm), i.e. ~10 units per mm.
+# Target = (object width - squeeze) * units/mm; falls back to grab() if the
+# do_command isn't accepted.
+GRIPPER_SQUEEZE_MM = 8.0
+GRIPPER_POS_PER_MM = 10.0
+GRIPPER_MAX_POS = 850
 
 # After a grasp attempt, lift back to the approach height and return to the
 # pose the gripper was at when the object was locked, so the camera sees the
@@ -94,17 +112,23 @@ RETURN_TO_START = True
 
 WEBCAM_INDEX = 0
 RELEASE_AFTER_SECONDS = 4.0   # show the grasp result on the frozen frame, then go live again
-WINDOW = "Gaze-selected pick (Q quit, R release lock)"
+WINDOW = "Gaze-selected pick (Q quit, R release lock, C recalibrate)"
 
 # `python main.py --dry-run`: full gaze -> lock -> 3D pose flow, prints what it
 # would send to the motion service and gripper, moves nothing.
 DRY_RUN = "--dry-run" in sys.argv
+SKIP_CALIBRATION = "--skip-calibration" in sys.argv
 
 
 async def connect():
     env = load_env()
-    opts = RobotClient.Options.with_api_key(api_key=env["VIAM_API_KEY"],
-                                            api_key_id=env["VIAM_API_KEY_ID"])
+    # The SDK's periodic health check has a 1 s deadline; a slow call on the
+    # machine (3D segmentation) trips it and the client tears the connection
+    # down. Disable the check; failures surface on the call itself instead.
+    opts = RobotClient.Options.with_api_key(
+        api_key=env["VIAM_API_KEY"], api_key_id=env["VIAM_API_KEY_ID"],
+        check_connection_interval=0, attempt_reconnect_interval=0,
+    )
     return await RobotClient.at_address(env["VIAM_MACHINE_ADDRESS"], opts)
 
 
@@ -212,7 +236,39 @@ async def move_to(motion: MotionClient, pose: Pose, label: str, job: GraspJob) -
     return ok
 
 
-async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, job: GraspJob) -> bool:
+def gripper_position_for_width(width_mm: float) -> int:
+    return int(max(0.0, min(GRIPPER_MAX_POS, (width_mm - GRIPPER_SQUEEZE_MM) * GRIPPER_POS_PER_MM)))
+
+
+async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJob) -> None:
+    """Close to the object's width via the uFactory module's move_gripper
+    do_command (tried on the gripper, then the arm, which is where the module
+    documents it); grab() if neither accepts it or there's no size estimate."""
+    if width_mm > 0:
+        target = gripper_position_for_width(width_mm)
+        job.status = f"object ~{width_mm:.0f} mm wide, closing gripper to position {target}"
+        print(f"[grab] {job.status}")
+        # Command names per viam-modules/viam-ufactory-xarm: the standalone
+        # gripper component takes {"set": pos}; the arm takes
+        # {"setup_gripper": true, "move_gripper": pos}.
+        attempts = (
+            (gripper, "gripper", {"set": target}),
+            (arm, "arm", {"setup_gripper": True, "move_gripper": target}),
+        )
+        for who, label, cmd in attempts:
+            try:
+                await who.do_command(cmd)
+                return
+            except Exception as e:
+                print(f"[grab] {cmd} on {label} not accepted ({type(e).__name__}: {e})")
+        print("[grab] width-based close unavailable; using grab()")
+    else:
+        job.status = "no size estimate, using grab()"
+        print(f"[grab] {job.status}")
+    await gripper.grab()
+
+
+async def grasp_object(motion: MotionClient, gripper: Gripper, arm: Arm, point_cloud_obj, job: GraspJob) -> bool:
     cs = object_center_and_size(point_cloud_obj)
     if cs is None:
         job.status = "selected object has no geometry, cannot compute a pose"
@@ -235,27 +291,18 @@ async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, 
 
     width = min((d for d in size[:2] if d > 0), default=0.0)
     if DRY_RUN:
-        job.status = (f"DRY RUN: would close gripper to ~{max(0.0, width - GRIPPER_CLEARANCE_MM):.0f} mm "
+        job.status = (f"DRY RUN: would close gripper to position {gripper_position_for_width(width)} "
                       f"(object ~{width:.0f} mm wide)" if width > 0 else "DRY RUN: would call grab()")
         print(f"[grab] {job.status}")
         return True
-    if width > 0:
-        target_mm = max(0.0, width - GRIPPER_CLEARANCE_MM)
-        job.status = f"object ~{width:.0f}mm wide, closing to {target_mm:.0f}mm"
-        print(f"[grab] {job.status}")
-        try:
-            # TODO verify against the gripper module's do_command docs: the command
-            # key and units (the demo gripper's position scale was 0-850, not mm).
-            await gripper.do_command({"move_to_position": {"position_mm": target_mm}})
-        except Exception as e:
-            print(f"[grab] width-based close unavailable ({e}); using grab()")
-            await gripper.grab()
-    else:
-        job.status = "no size estimate, using grab()"
-        await gripper.grab()
+    await close_gripper(gripper, arm, width, job)
 
-    job.holding = await gripper.is_holding_something()
-    print(f"[grab] grab complete, holding_something={job.holding}")
+    # is_holding_something() returns a HoldingStatus (truthy even when False);
+    # its meta carries the gripper position on the 0-850 scale.
+    status = await gripper.is_holding_something()
+    job.holding = bool(getattr(status, "is_holding_something", status))
+    print(f"[grab] grab complete, holding_something={job.holding} "
+          f"(gripper position={getattr(status, 'meta', {}).get('position', '?')})")
 
     if start is not None:
         await move_to(motion, approach, "approach (lift)", job)
@@ -266,17 +313,17 @@ async def grasp_object(motion: MotionClient, gripper: Gripper, point_cloud_obj, 
     return bool(job.holding)
 
 
-async def run_grasp(segmenter: VisionClient, motion: MotionClient, gripper: Gripper,
+async def run_grasp(segmenter: VisionClient, motion: MotionClient, gripper: Gripper, arm: Arm,
                     box: Box, job: GraspJob) -> bool:
     try:
         # Freeze the 3D target NOW, before the arm (and the camera on it) moves.
-        objs = await segmenter.get_object_point_clouds(CAMERA_NAME)
+        objs = await segmenter.get_object_point_clouds(CAMERA_NAME, timeout=SEGMENTER_TIMEOUT_S)
         match = select_object_for_box(objs, box.label, box.index)
         if match is None:
             job.status = f"no matching 3D object for '{box.label}'"
             print(f"[grab] {job.status}")
             return False
-        return await grasp_object(motion, gripper, match, job)
+        return await grasp_object(motion, gripper, arm, match, job)
     except Exception as e:
         job.status = f"error: {e}"
         print(f"[grab] {job.status}")
@@ -301,10 +348,13 @@ def resolve_motion_name(machine) -> str:
 
 
 def load_or_calibrate(gaze: WebcamGazeTracker, frame_w: int, frame_h: int) -> GazeCalibration:
-    if CALIBRATION_PATH.exists():
+    """Calibrate every run, like gaze_dot.py: a saved calibration from a
+    different sitting position is what makes the gaze feel off.
+    `--skip-calibration` reuses the last one; C recalibrates mid-run."""
+    if SKIP_CALIBRATION and CALIBRATION_PATH.exists():
         calib = GazeCalibration.load()
         if (calib.frame_w, calib.frame_h) == (frame_w, frame_h):
-            print(f"[main] loaded calibration from {CALIBRATION_PATH}")
+            print(f"[main] --skip-calibration: reusing {CALIBRATION_PATH}")
             return calib
         print("[main] saved calibration is for a different frame size, recalibrating")
     return run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True)
@@ -319,6 +369,7 @@ async def main():
     segmenter = VisionClient.from_robot(machine, SEGMENTER_NAME)
     motion = MotionClient.from_robot(machine, motion_name)
     gripper = Gripper.from_robot(machine, GRIPPER_NAME)
+    arm = Arm.from_robot(machine, ARM_NAME)
 
     gaze = WebcamGazeTracker(camera_index=WEBCAM_INDEX)
     smoother = GazeSmoother()
@@ -364,7 +415,7 @@ async def main():
             if locked is not None:
                 print(f"[lock] locked onto '{locked.box.label}' (index {locked.box.index})")
                 job = GraspJob()
-                job.task = asyncio.create_task(run_grasp(segmenter, motion, gripper, locked.box, job))
+                job.task = asyncio.create_task(run_grasp(segmenter, motion, gripper, arm, locked.box, job))
                 continue
 
             view = draw_live(frame, boxes, hovered, progress, gaze_pt)
@@ -375,8 +426,12 @@ async def main():
                 cv2.putText(view, "BLINK", (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.imshow(WINDOW, view)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("c"):
+                calib = run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True)
+                smoother.reset()
     finally:
         if job is not None and job.task is not None and not job.task.done():
             print("[main] waiting for the in-progress grasp to finish before exiting...")

@@ -100,7 +100,7 @@ def main():
     ap.add_argument("--weights", default="yolov8n.pt")
     ap.add_argument("--conf", type=float, default=0.4)
     ap.add_argument("--detect-every", type=int, default=2, help="run YOLO every N frames (video/camera)")
-    ap.add_argument("--recalibrate", action="store_true")
+    ap.add_argument("--skip-calibration", action="store_true", help="reuse the last saved calibration")
     args = ap.parse_args()
 
     scene = Scene(args.scene)
@@ -120,7 +120,7 @@ def main():
         return run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True)
 
     calib = None
-    if not args.recalibrate and CALIBRATION_PATH.exists():
+    if args.skip_calibration and CALIBRATION_PATH.exists():
         calib = GazeCalibration.load()
         if (calib.frame_w, calib.frame_h) != (frame_w, frame_h):
             print("[demo] saved calibration is for a different frame size, recalibrating")

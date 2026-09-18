@@ -46,6 +46,10 @@ RIGHT_EYE_CORNERS = (362, 263)
 RIGHT_LID = (159, 145)
 LEFT_LID = (386, 374)
 
+# Same capture size as gaze_dot.py: more pixels on the eyes = steadier iris landmarks.
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
 BLINK_EAR_THRESHOLD = 0.17
 DWELL_SECONDS = 0.9
 DWELL_GRACE_SECONDS = 0.25   # a brief gaze wobble outside the box doesn't reset the dwell
@@ -242,7 +246,8 @@ class GazeCalibration:
 class WebcamGazeTracker:
     """Owns the laptop webcam + MediaPipe FaceLandmarker for live gaze tracking."""
 
-    def __init__(self, camera_index: int = 0, model_path: Path = MODEL_PATH):
+    def __init__(self, camera_index: int = 0, model_path: Path = MODEL_PATH,
+                 width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT):
         if not model_path.exists():
             raise FileNotFoundError(f"Missing MediaPipe model at {model_path}")
 
@@ -259,11 +264,16 @@ class WebcamGazeTracker:
         self._cap = cv2.VideoCapture(camera_index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Could not open webcam at index {camera_index}")
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._start = time.monotonic()
         self._last_timestamp_ms = -1
         # Camera warmup: auto-exposure can take several frames to settle.
+        frame = None
         for _ in range(15):
-            self._cap.read()
+            _, frame = self._cap.read()
+        got = f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "unknown"
+        print(f"[gaze] webcam {camera_index} capturing at {got} (asked for {width}x{height})")
 
     def read(self):
         """Returns (frame_bgr, landmarks|None, features|None, ear|None)."""

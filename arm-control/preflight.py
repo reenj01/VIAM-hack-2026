@@ -10,16 +10,18 @@ in a good top-down position).
 """
 
 import asyncio
+import time
 
-from viam.robot.client import RobotClient
+from viam.components.arm import Arm
 from viam.components.camera import Camera
 from viam.components.gripper import Gripper
 from viam.services.vision import VisionClient
 from viam.services.motion import MotionClient
 
 from main import (
-    CAMERA_NAME, DETECTOR_NAME, SEGMENTER_NAME, MOTION_SERVICE_NAME, GRIPPER_NAME,
-    MOTION_REFERENCE_FRAME, decode_color_frame, load_env, object_center_and_size, object_label,
+    ARM_NAME, CAMERA_NAME, DETECTOR_CANDIDATES, DETECTOR_NAME, SEGMENTER_NAME, MOTION_SERVICE_NAME, GRIPPER_NAME,
+    MOTION_REFERENCE_FRAME, SEGMENTER_TIMEOUT_S, connect, decode_color_frame,
+    object_center_and_size, object_label,
 )
 
 
@@ -53,19 +55,32 @@ async def check_camera(machine):
     print("   color frame:", "NONE (nothing decoded)" if frame is None else f"{frame.shape[1]}x{frame.shape[0]}")
 
 
-async def check_detector(machine):
-    det = VisionClient.from_robot(machine, DETECTOR_NAME)
+async def check_detector(machine, name):
+    det = VisionClient.from_robot(machine, name)
     dets = await det.get_detections_from_camera(CAMERA_NAME)
     print(f"   {len(dets)} detection(s)")
     for d in dets:
         print(f"     {d.class_name:14} {d.confidence:.2f}  px=({d.x_min},{d.y_min})-({d.x_max},{d.y_max})"
               f"  norm=({d.x_min_normalized:.2f},{d.y_min_normalized:.2f})-({d.x_max_normalized:.2f},{d.y_max_normalized:.2f})")
+    return {d.class_name for d in dets}
 
 
-async def check_segmenter(machine):
+async def check_segmenter(machine, detector_labels):
     seg = VisionClient.from_robot(machine, SEGMENTER_NAME)
-    objs = await seg.get_object_point_clouds(CAMERA_NAME)
-    print(f"   {len(objs)} 3D object(s)")
+    t0 = time.monotonic()
+    objs = await seg.get_object_point_clouds(CAMERA_NAME, timeout=SEGMENTER_TIMEOUT_S)
+    print(f"   {len(objs)} 3D object(s) in {time.monotonic() - t0:.1f}s")
+    seg_labels = {object_label(o) for o in objs} - {""}
+    if seg_labels:
+        matched = [n for n, ls in detector_labels.items() if seg_labels & ls]
+        if DETECTOR_NAME in matched:
+            print(f"   labels match '{DETECTOR_NAME}' -> objects-3d is wired to the detector main.py uses")
+        elif matched:
+            print(f"   WARNING: labels match {matched}, not '{DETECTOR_NAME}'. In the Viam app set "
+                  f"objects-3d's detector_name to '{DETECTOR_NAME}' (or run main.py --detector {matched[0]})")
+        else:
+            print(f"   WARNING: labels {sorted(seg_labels)} match none of the detectors' current labels; "
+                  f"check objects-3d's detector_name in the Viam app")
     for i, o in enumerate(objs):
         cs = object_center_and_size(o)
         frame = o.geometries.reference_frame
@@ -84,6 +99,20 @@ async def check_gripper(machine):
     gr = Gripper.from_robot(machine, GRIPPER_NAME)
     print("   is_moving:", await gr.is_moving())
     print("   is_holding_something:", await gr.is_holding_something())
+    arm = Arm.from_robot(machine, ARM_NAME)
+    probes = (
+        (gr, f"gripper '{GRIPPER_NAME}'", {"get": True}),
+        (arm, f"arm '{ARM_NAME}'", {"get_gripper": True}),
+    )
+    for who, label, cmd in probes:
+        try:
+            resp = await who.do_command(cmd)
+            print(f"   do_command {cmd} on {label}: {resp}  <- width-based close works via this component")
+            break
+        except Exception as e:
+            print(f"   do_command {cmd} on {label}: not accepted ({type(e).__name__})")
+    else:
+        print("   no component accepts gripper do_commands; main.py will fall back to grab()")
 
 
 async def check_motion(machine):
@@ -97,14 +126,17 @@ async def check_motion(machine):
 
 
 async def main():
-    env = load_env()
-    opts = RobotClient.Options.with_api_key(api_key=env["VIAM_API_KEY"], api_key_id=env["VIAM_API_KEY_ID"])
-    machine = await RobotClient.at_address(env["VIAM_MACHINE_ADDRESS"], opts)
+    machine = await connect()
     try:
         await step("Resource names", check_names(machine))
         await step("Camera", check_camera(machine))
-        await step("YOLO detector", check_detector(machine))
-        await step("3D segmenter", check_segmenter(machine))
+        have = {r.name for r in machine.resource_names}
+        detector_labels = {}
+        for name in dict.fromkeys((DETECTOR_NAME, *DETECTOR_CANDIDATES)):
+            if name in have:
+                tag = " (the one main.py uses)" if name == DETECTOR_NAME else ""
+                detector_labels[name] = await step(f"Detector '{name}'{tag}", check_detector(machine, name)) or set()
+        await step("3D segmenter", check_segmenter(machine, detector_labels))
         await step("Gripper", check_gripper(machine))
         await step("Motion / gripper pose", check_motion(machine))
     finally:
