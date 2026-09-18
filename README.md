@@ -21,10 +21,10 @@ Allow camera access if macOS asks.
 
 ## Controls
 
-- `C`: begin calibration
-- `R`: recalibrate
+- `C`: begin calibration — first shows an ID-photo-style oval frame; center your face in it and hold still for a second, then the 9-point calibration starts automatically
+- `R`: recalibrate (same framing step first)
 - `Q` or `Escape`: quit
 
 ## Notes
 
-Keep the preview window at the same size and position used during calibration. Recalibrate after changing seating position, lighting, or display.
+Keep the preview window at the same size and position used during calibration. Recalibrate after changing seating position, lighting, or display. The framing step (orange oval = not aligned, green = aligned) exists because the 9-point calibration assumes a stable head pose and distance from the camera throughout — starting from a consistent position measurably improves calibration accuracy.
