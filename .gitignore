@@ -1,0 +1,17 @@
+# Local virtual environment created before the project was reorganized
+VIAM-hack-2026/
+
+# Common virtual-environment names
+.venv/
+venv/
+
+# Credentials for a future Viam connection
+.env
+
+# Downloaded MediaPipe model; setup instructions fetch it locally
+face_landmarker.task
+
+# Generated files
+__pycache__/
+*.py[cod]
+.DS_Store
