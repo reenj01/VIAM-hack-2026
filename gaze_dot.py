@@ -29,6 +29,25 @@ MIN_SAMPLES_PER_POINT = 10    # lowered: settle window eats part of the capture
 DOT_RADIUS = 14
 SMOOTHING = 0.80
 
+# ID-photo-style framing gate, run once before the 9-point calibration starts.
+FRAME_TARGET_CX = 0.50      # oval center, normalized screen coords
+FRAME_TARGET_CY = 0.45      # slightly above vertical center, like a passport photo guide
+FRAME_TARGET_W = 0.34       # oval width as a fraction of frame width
+FRAME_TARGET_H = 0.62       # oval height as a fraction of frame height
+FRAME_POSITION_TOLERANCE = 0.05   # how far off-center the face may be, normalized
+FRAME_SIZE_RATIO_LOW = 0.85       # face bbox height / target height below this = too far away
+FRAME_SIZE_RATIO_HIGH = 1.20      # above this = too close
+FRAME_HOLD_SECONDS = 1.0          # must stay aligned this long before calibration auto-starts
+
+FRAME_MESSAGES = {
+    "move_left": "Move left to center your face in the frame",
+    "move_right": "Move right to center your face in the frame",
+    "move_up": "Move up to center your face in the frame",
+    "move_down": "Move down to center your face in the frame",
+    "move_closer": "Move closer to the camera",
+    "move_back": "Move back from the camera",
+}
+
 TARGETS = [
     (0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
     (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
@@ -115,6 +134,46 @@ def draw_status(frame, message: str) -> None:
     cv2.putText(frame, message, (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
 
+def face_bbox_normalized(landmarks) -> tuple[float, float, float, float]:
+    """Bounding box (left, top, right, bottom) of all face landmarks, normalized [0, 1]."""
+    xs = np.array([p.x for p in landmarks])
+    ys = np.array([p.y for p in landmarks])
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
+def evaluate_framing(bbox, target_cx, target_cy, target_w, target_h,
+                      pos_tolerance, size_low, size_high) -> tuple[str, bool]:
+    """Compare the face bbox to the target oval and return (status_code, aligned)."""
+    left, top, right, bottom = bbox
+    face_cx = (left + right) / 2
+    face_cy = (top + bottom) / 2
+    face_h = bottom - top
+
+    dx = face_cx - target_cx
+    dy = face_cy - target_cy
+    size_ratio = face_h / target_h
+
+    # Frame is already mirrored (selfie view), so on-screen directions read naturally:
+    # face right-of-center on screen -> tell the user to move left, matching a real mirror.
+    if abs(dx) > pos_tolerance:
+        return ("move_left" if dx > 0 else "move_right"), False
+    if abs(dy) > pos_tolerance:
+        return ("move_up" if dy > 0 else "move_down"), False
+    if size_ratio < size_low:
+        return "move_closer", False
+    if size_ratio > size_high:
+        return "move_back", False
+    return "aligned", True
+
+
+def draw_id_frame(frame, target_cx, target_cy, target_w, target_h, aligned: bool) -> None:
+    height, width = frame.shape[:2]
+    center = (int(target_cx * width), int(target_cy * height))
+    axes = (int(target_w * width / 2), int(target_h * height / 2))
+    color = (0, 200, 0) if aligned else (0, 165, 255)
+    cv2.ellipse(frame, center, axes, 0, 0, 360, color, 3)
+
+
 def main() -> None:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -144,6 +203,8 @@ def main() -> None:
     calibration_targets: list[np.ndarray] = []
     calibrated = False
     calibrating = False
+    framing = False
+    frame_hold_started = 0.0
     target_index = 0
     target_started_at = 0.0
     target_samples: list[np.ndarray] = []
@@ -171,12 +232,41 @@ def main() -> None:
 
             result = landmarker.detect_for_video(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame), timestamp_ms)
-            features = gaze_features(result.face_landmarks[0]) if result.face_landmarks else None
+            landmarks = result.face_landmarks[0] if result.face_landmarks else None
+            features = gaze_features(landmarks) if landmarks is not None else None
 
             now = time.monotonic()
             height, width = frame.shape[:2]
 
-            if calibrating:
+            if framing:
+                if landmarks is None:
+                    frame_hold_started = 0.0
+                    draw_id_frame(frame, FRAME_TARGET_CX, FRAME_TARGET_CY,
+                                  FRAME_TARGET_W, FRAME_TARGET_H, aligned=False)
+                    draw_status(frame, "Face not found. Center your face in the frame.")
+                else:
+                    bbox = face_bbox_normalized(landmarks)
+                    status, aligned = evaluate_framing(
+                        bbox, FRAME_TARGET_CX, FRAME_TARGET_CY, FRAME_TARGET_W, FRAME_TARGET_H,
+                        FRAME_POSITION_TOLERANCE, FRAME_SIZE_RATIO_LOW, FRAME_SIZE_RATIO_HIGH)
+                    draw_id_frame(frame, FRAME_TARGET_CX, FRAME_TARGET_CY,
+                                  FRAME_TARGET_W, FRAME_TARGET_H, aligned)
+
+                    if aligned:
+                        if frame_hold_started == 0.0:
+                            frame_hold_started = now
+                        remaining = max(0.0, FRAME_HOLD_SECONDS - (now - frame_hold_started))
+                        draw_status(frame, "Hold still..." if remaining > 0 else "Starting calibration...")
+                        if remaining <= 0.0:
+                            framing = False
+                            calibrating = True
+                            target_index = 0
+                            target_started_at = 0.0
+                    else:
+                        frame_hold_started = 0.0
+                        draw_status(frame, FRAME_MESSAGES[status])
+
+            elif calibrating:
                 if target_started_at == 0.0:
                     target_started_at = now
                 elapsed = now - target_started_at
@@ -240,12 +330,13 @@ def main() -> None:
             if key in (ord("c"), ord("r")):
                 calibration_samples, calibration_targets, target_samples = [], [], []
                 calibrated = calibrating = False
-                calibrating = True
+                framing = True
+                frame_hold_started = 0.0
                 target_index = 0
                 target_started_at = 0.0
                 mapping = None
                 smoothed_dot = None
-                print("Calibration started. Look at each target until it fills.")
+                print("Center your face in the frame. Calibration starts automatically once aligned.")
 
     camera.release()
     cv2.destroyAllWindows()
