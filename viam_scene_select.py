@@ -1,8 +1,7 @@
 """Fullscreen gaze selection for one frozen Viam camera snapshot.
 
-This program reads a Viam camera image and YOLO detections after calibration.
-It does not send any arm or gripper commands. Put the arm at its safe observe
-pose manually before starting it, then press N to capture a fresh scene.
+This program rotates joint 4 for laptop gaze calibration, returns the arm to
+its starting pose, then reads a Viam camera image and YOLO detections.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from dotenv import load_dotenv
+from viam.components.arm import Arm
+from viam.proto.component.arm import JointPositions
 from viam.robot.client import RobotClient
 from viam.services.vision import VisionClient
 
@@ -199,8 +200,25 @@ async def main() -> None:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Missing {MODEL_PATH.name}. See README.md for the download command.")
 
+    load_dotenv()
     camera_name = os.getenv("VIAM_CAMERA_NAME", "cam")
     detector_name = os.getenv("VIAM_DETECTOR_NAME", "yolo-detector")
+    arm_name = os.getenv("VIAM_ARM_NAME", "arm")
+    joint_4_delta_deg = float(os.getenv("VIAM_CALIBRATION_JOINT_4_DELTA_DEG", "-10"))
+    settle_seconds = float(os.getenv("VIAM_CALIBRATION_MOVE_SETTLE_SECONDS", "1"))
+
+    # Keep this connection open so the script can safely return the arm even
+    # if calibration is cancelled or an error occurs. The snapshot helper uses
+    # a separate, short-lived connection because image transfer can reconnect.
+    arm_robot = await connect()
+    arm = Arm.from_robot(arm_robot, arm_name)
+    original_joints = await arm.get_joint_positions()
+    calibration_joint_values = list(original_joints.values)
+    if len(calibration_joint_values) < 4:
+        await arm_robot.close()
+        raise RuntimeError(f"Arm {arm_name!r} has fewer than four joints.")
+    calibration_joint_values[3] += joint_4_delta_deg
+    arm_is_rotated = False
 
     laptop_camera = cv2.VideoCapture(CAMERA_INDEX)
     laptop_camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
@@ -239,6 +257,13 @@ async def main() -> None:
     fullscreen_applied = False
 
     try:
+        print(
+            f"Rotating joint 4 by {joint_4_delta_deg:.1f} degrees for calibration. "
+            "Keep clear of the arm."
+        )
+        await arm.move_to_joint_positions(JointPositions(values=calibration_joint_values))
+        arm_is_rotated = True
+        await asyncio.sleep(settle_seconds)
         print("Face calibration ready. Press C to begin; Q quits.")
 
         with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
@@ -328,8 +353,10 @@ async def main() -> None:
                                 raise RuntimeError("Too few reliable calibration targets. Press C and try again.")
                             mapping = fit_calibration(calibration_samples, calibration_targets)
                             calibrating, calibrated, smoothed_dot = False, True, None
-                            # Do not move the arm here. The operator must have
-                            # already placed it at the safe observe pose.
+                            print("Calibration complete. Returning arm to its original pose...")
+                            await arm.move_to_joint_positions(original_joints)
+                            arm_is_rotated = False
+                            await asyncio.sleep(settle_seconds)
                             snapshot = await capture_fresh_snapshot(camera_name, detector_name)
                             print("Calibration complete. RealSense scene captured for gaze selection.")
                 elif calibrated and snapshot is not None and smoothed_dot is not None:
@@ -366,6 +393,13 @@ async def main() -> None:
     finally:
         laptop_camera.release()
         cv2.destroyAllWindows()
+        if arm_is_rotated:
+            try:
+                print("Returning arm to its original pose before closing...")
+                await arm.move_to_joint_positions(original_joints)
+            except Exception as error:
+                print(f"Could not return the arm automatically: {error}")
+        await arm_robot.close()
 
 
 if __name__ == "__main__":
