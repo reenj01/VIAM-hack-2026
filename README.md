@@ -27,7 +27,7 @@ Allow camera access if macOS asks.
 
 ## Fullscreen Viam scene selection
 
-`viam_scene_select.py` reads one coherent snapshot (image, boxes, and 3D segments) from a configured Viam vision service. It displays the RealSense image fullscreen, calibrates gaze against that display, and highlights the detected box under the red dot. It never moves the robot.
+`viam_scene_select.py` reads one frozen RealSense image and its YOLO detection boxes after calibration. It displays the image fullscreen and highlights the detected box under the red dot. It never moves the robot or fetches full 3D point-cloud data during this display stage.
 
 1. Copy `.env.example` to `.env` and fill in your Viam machine address, API key, API key ID, and component names.
 2. Manually put the arm at its safe observe pose and make sure it stays still.

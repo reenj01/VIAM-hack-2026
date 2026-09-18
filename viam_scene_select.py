@@ -1,8 +1,8 @@
 """Fullscreen gaze selection for one frozen Viam camera snapshot.
 
-This program connects only to read a Viam vision snapshot. It does not send
-any arm or gripper commands. Put the arm at its safe observe pose manually
-before starting it, then press N to capture a fresh scene.
+This program reads a Viam camera image and YOLO detections after calibration.
+It does not send any arm or gripper commands. Put the arm at its safe observe
+pose manually before starting it, then press N to capture a fresh scene.
 """
 
 from __future__ import annotations
@@ -25,6 +25,15 @@ from gaze_dot import (
     CAMERA_HEIGHT,
     CAMERA_INDEX,
     CAMERA_WIDTH,
+    FRAME_HOLD_SECONDS,
+    FRAME_MESSAGES,
+    FRAME_POSITION_TOLERANCE,
+    FRAME_SIZE_RATIO_HIGH,
+    FRAME_SIZE_RATIO_LOW,
+    FRAME_TARGET_CX,
+    FRAME_TARGET_CY,
+    FRAME_TARGET_H,
+    FRAME_TARGET_W,
     LEFT_EYE_CORNERS,
     LEFT_IRIS,
     MIN_SAMPLES_PER_POINT,
@@ -33,6 +42,9 @@ from gaze_dot import (
     RIGHT_IRIS,
     SETTLE_SECONDS,
     TARGETS,
+    draw_id_frame,
+    evaluate_framing,
+    face_bbox_normalized,
     fit_calibration,
     gaze_features,
 )
@@ -98,22 +110,45 @@ async def connect() -> RobotClient:
     return await RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], options)
 
 
-async def capture_snapshot(segmenter: VisionClient, camera_name: str) -> SceneSnapshot:
-    """Capture image, 2D detections, and 3D segments in one Viam request."""
-    result = await segmenter.capture_all_from_camera(
+async def capture_snapshot(detector: VisionClient, camera_name: str) -> SceneSnapshot:
+    """Capture the display image and boxes without transferring bulky PCD data."""
+    result = await detector.capture_all_from_camera(
         camera_name,
         return_image=True,
         return_detections=True,
-        return_object_point_clouds=True,
+        return_object_point_clouds=False,
+        timeout=15,
     )
     if result.image is None:
         raise RuntimeError("objects-3d returned no image. Check its camera configuration.")
     return SceneSnapshot(
         image=decode_viam_image(result.image),
         detections=list(result.detections or []),
-        object_point_clouds=list(result.objects or []),
+        object_point_clouds=[],
         captured_at=time.monotonic(),
     )
+
+
+async def capture_fresh_snapshot(camera_name: str, detector_name: str) -> SceneSnapshot:
+    """Open a short-lived Viam connection and retry one transient disconnect."""
+    last_error: Exception | None = None
+    for attempt in range(2):
+        robot: RobotClient | None = None
+        try:
+            robot = await connect()
+            detector = VisionClient.from_robot(robot, detector_name)
+            return await capture_snapshot(detector, camera_name)
+        except Exception as error:
+            last_error = error
+            if attempt == 0:
+                await asyncio.sleep(1)
+        finally:
+            if robot is not None:
+                await robot.close()
+    raise RuntimeError(
+        "Could not capture the RealSense image and YOLO boxes after two attempts. "
+        "Check that the Viam machine, cam, and yolo-detector are online."
+    ) from last_error
 
 
 def fit_image_to_canvas(image: np.ndarray, canvas_width: int, canvas_height: int) -> tuple[np.ndarray, DisplayLayout]:
@@ -148,8 +183,9 @@ def draw_detections(canvas: np.ndarray, detections: list, layout: DisplayLayout,
 
 
 def draw_status(canvas: np.ndarray, message: str) -> None:
-    cv2.rectangle(canvas, (15, 15), (min(canvas.shape[1] - 15, 1180), 75), (0, 0, 0), -1)
-    cv2.putText(canvas, message, (32, 53), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    # Start at y=0 so no light image strip remains above the status bar.
+    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 68), (0, 0, 0), -1)
+    cv2.putText(canvas, message, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
 
 def draw_target(canvas: np.ndarray, target: tuple[float, float], number: int, progress: float) -> None:
@@ -163,16 +199,13 @@ async def main() -> None:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Missing {MODEL_PATH.name}. See README.md for the download command.")
 
-    robot = await connect()
     camera_name = os.getenv("VIAM_CAMERA_NAME", "cam")
-    segmenter_name = os.getenv("VIAM_SEGMENTER_NAME", "objects-3d")
-    segmenter = VisionClient.from_robot(robot, segmenter_name)
+    detector_name = os.getenv("VIAM_DETECTOR_NAME", "yolo-detector")
 
     laptop_camera = cv2.VideoCapture(CAMERA_INDEX)
     laptop_camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     laptop_camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     if not laptop_camera.isOpened():
-        await robot.close()
         raise RuntimeError("Could not open the laptop webcam. Try CAMERA_INDEX = 0 in gaze_dot.py.")
 
     options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -184,10 +217,15 @@ async def main() -> None:
         min_tracking_confidence=0.6,
     )
 
+    # The scene is deliberately not captured yet. Calibration happens against
+    # the laptop-webcam view first; only afterwards do we freeze the arm-camera
+    # image and its detections for selection.
     snapshot: SceneSnapshot | None = None
     calibration_samples: list[np.ndarray] = []
     calibration_targets: list[np.ndarray] = []
     calibrating = False
+    framing = False
+    frame_hold_started = 0.0
     calibrated = False
     target_index = 0
     target_started_at = 0.0
@@ -198,10 +236,10 @@ async def main() -> None:
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    fullscreen_applied = False
 
     try:
-        snapshot = await capture_snapshot(segmenter, camera_name)
-        print("Scene captured. Press C to calibrate; N captures a new scene; Q quits.")
+        print("Face calibration ready. Press C to begin; Q quits.")
 
         with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
             while True:
@@ -213,13 +251,21 @@ async def main() -> None:
                 timestamp_ms = max(last_timestamp_ms + 1, int(time.monotonic() * 1000))
                 last_timestamp_ms = timestamp_ms
                 result = landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp_ms)
-                features = gaze_features(result.face_landmarks[0]) if result.face_landmarks else None
+                landmarks = result.face_landmarks[0] if result.face_landmarks else None
+                features = gaze_features(landmarks) if landmarks is not None else None
 
                 canvas_height, canvas_width = laptop_frame.shape[:2]
-                canvas, layout = fit_image_to_canvas(snapshot.image, canvas_width, canvas_height)
+                # Until calibration finishes, the user sees their mirrored
+                # laptop-webcam feed. The calibration targets are in the same
+                # fullscreen canvas coordinates used later for the RealSense view.
+                canvas = laptop_frame.copy()
+                layout: DisplayLayout | None = None
                 active_index: int | None = None
 
-                if calibrated and features is not None and mapping is not None:
+                if calibrated and snapshot is not None:
+                    canvas, layout = fit_image_to_canvas(snapshot.image, canvas_width, canvas_height)
+
+                if calibrated and snapshot is not None and features is not None and mapping is not None:
                     predicted = features @ mapping
                     predicted[0] = np.clip(predicted[0], 0, canvas_width - 1)
                     predicted[1] = np.clip(predicted[1], 0, canvas_height - 1)
@@ -229,9 +275,40 @@ async def main() -> None:
                         hits = [i for i, detection in enumerate(snapshot.detections) if detection_contains(detection, image_point)]
                         active_index = hits[0] if hits else None
 
-                draw_detections(canvas, snapshot.detections, layout, active_index)
+                if calibrated and snapshot is not None and layout is not None:
+                    draw_detections(canvas, snapshot.detections, layout, active_index)
                 now = time.monotonic()
-                if calibrating:
+                if framing:
+                    # This is deliberately identical to gaze_dot.py's
+                    # pre-calibration posture gate: the same oval, target
+                    # dimensions, feedback, and one-second steady hold.
+                    if landmarks is None:
+                        frame_hold_started = 0.0
+                        draw_id_frame(canvas, FRAME_TARGET_CX, FRAME_TARGET_CY,
+                                      FRAME_TARGET_W, FRAME_TARGET_H, aligned=False)
+                        draw_status(canvas, "Face not found. Center your face in the frame.")
+                    else:
+                        bbox = face_bbox_normalized(landmarks)
+                        status, aligned = evaluate_framing(
+                            bbox, FRAME_TARGET_CX, FRAME_TARGET_CY, FRAME_TARGET_W, FRAME_TARGET_H,
+                            FRAME_POSITION_TOLERANCE, FRAME_SIZE_RATIO_LOW, FRAME_SIZE_RATIO_HIGH)
+                        draw_id_frame(canvas, FRAME_TARGET_CX, FRAME_TARGET_CY,
+                                      FRAME_TARGET_W, FRAME_TARGET_H, aligned)
+                        if aligned:
+                            if frame_hold_started == 0.0:
+                                frame_hold_started = now
+                            remaining = max(0.0, FRAME_HOLD_SECONDS - (now - frame_hold_started))
+                            draw_status(canvas, "Hold still..." if remaining > 0 else "Starting calibration...")
+                            if remaining <= 0.0:
+                                framing = False
+                                calibrating = True
+                                target_index = 0
+                                target_started_at = 0.0
+                        else:
+                            frame_hold_started = 0.0
+                            draw_status(canvas, FRAME_MESSAGES[status])
+
+                elif calibrating:
                     if target_started_at == 0.0:
                         target_started_at = now
                     elapsed = now - target_started_at
@@ -251,7 +328,11 @@ async def main() -> None:
                                 raise RuntimeError("Too few reliable calibration targets. Press C and try again.")
                             mapping = fit_calibration(calibration_samples, calibration_targets)
                             calibrating, calibrated, smoothed_dot = False, True, None
-                elif calibrated and smoothed_dot is not None:
+                            # Do not move the arm here. The operator must have
+                            # already placed it at the safe observe pose.
+                            snapshot = await capture_fresh_snapshot(camera_name, detector_name)
+                            print("Calibration complete. RealSense scene captured for gaze selection.")
+                elif calibrated and snapshot is not None and smoothed_dot is not None:
                     center = tuple(np.round(smoothed_dot).astype(int))
                     cv2.circle(canvas, center, DOT_RADIUS, (0, 0, 255), -1)
                     cv2.circle(canvas, center, DOT_RADIUS + 3, (255, 255, 255), 2)
@@ -260,25 +341,31 @@ async def main() -> None:
                     else:
                         draw_status(canvas, "Gaze is outside a selectable box. N refreshes the frozen scene; R recalibrates.")
                 else:
-                    draw_status(canvas, "Press C to calibrate against this fullscreen RealSense image. N refreshes scene; Q quits.")
+                    draw_id_frame(canvas, FRAME_TARGET_CX, FRAME_TARGET_CY,
+                                  FRAME_TARGET_W, FRAME_TARGET_H, aligned=False)
+                    draw_status(canvas, "Press C, center your face in the oval, then keep your head still.")
 
                 cv2.imshow(WINDOW_NAME, canvas)
+                # See the matching gaze_dot.py call: this second application
+                # removes the macOS title-bar strip after first render.
+                if not fullscreen_applied:
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    fullscreen_applied = True
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 if key in (ord("c"), ord("r")):
                     calibration_samples, calibration_targets, target_samples = [], [], []
-                    calibrating, calibrated, target_index = True, False, 0
+                    calibrating, framing, calibrated, target_index = False, True, False, 0
+                    frame_hold_started = 0.0
                     target_started_at, mapping, smoothed_dot = 0.0, None, None
                 if key == ord("n"):
-                    if not calibrated:
-                        snapshot = await capture_snapshot(segmenter, camera_name)
-                    else:
-                        print("Recalibrate after a new snapshot so its display layout remains consistent.")
+                    if calibrated:
+                        snapshot = await capture_fresh_snapshot(camera_name, detector_name)
+                        print("RealSense scene refreshed. The arm must remain at its observe pose.")
     finally:
         laptop_camera.release()
         cv2.destroyAllWindows()
-        await robot.close()
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ SMOOTHING = 0.80
 
 # ID-photo-style framing gate, run once before the 9-point calibration starts.
 FRAME_TARGET_CX = 0.50      # oval center, normalized screen coords
-FRAME_TARGET_CY = 0.45      # slightly above vertical center, like a passport photo guide
+FRAME_TARGET_CY = 0.60      # lower in the frame; leaves room for the top status bar
 FRAME_TARGET_W = 0.34       # oval width as a fraction of frame width
 FRAME_TARGET_H = 0.62       # oval height as a fraction of frame height
 FRAME_POSITION_TOLERANCE = 0.05   # how far off-center the face may be, normalized
@@ -130,8 +130,9 @@ def draw_target(frame, point, number, progress, settling) -> None:
 
 
 def draw_status(frame, message: str) -> None:
-    cv2.rectangle(frame, (10, 10), (min(frame.shape[1] - 10, 900), 75), (0, 0, 0), -1)
-    cv2.putText(frame, message, (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    # Start at y=0 so no light webcam strip remains above the status bar.
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 68), (0, 0, 0), -1)
+    cv2.putText(frame, message, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
 
 def face_bbox_normalized(landmarks) -> tuple[float, float, float, float]:
@@ -214,6 +215,7 @@ def main() -> None:
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    fullscreen_applied = False
     print("Press C to start calibration. Press Q or Escape to quit.")
 
     with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
@@ -324,6 +326,11 @@ def main() -> None:
                 draw_status(frame, "Press C to calibrate. Sit still and keep your face in view.")
 
             cv2.imshow(WINDOW_NAME, frame)
+            # On macOS, applying fullscreen after the first rendered frame
+            # reliably removes the native white title-bar strip.
+            if not fullscreen_applied:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                fullscreen_applied = True
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
