@@ -127,6 +127,14 @@ GRASP_HEIGHT_FRACTION = 0.60         # grip a tall item 60% up from the table
 DEFAULT_OBJECT_HEIGHT_MM = 100.0
 MIN_TARGET_RADIUS_MM = 200.0
 MAX_TARGET_RADIUS_MM = 600.0
+# Temporary fixed-observe-pose correction. The mounted camera/frame system
+# currently projects table targets about 3 in (76.2 mm) too close to the arm
+# base. Positive values move a target radially away from the base.
+RADIAL_OUTWARD_CORRECTION_MM = 76.2
+# The arm's installed world-X direction is opposite the initial assumption.
+# Positive world X moves the physical pinch point 3.5 in left while keeping
+# the same north/away-from-base (Y) line.
+LATERAL_X_CORRECTION_MM = 88.9
 
 # Measured user objects. Values are millimetres (1 inch = 25.4 mm).
 OBJECT_DIMENSIONS_MM = {
@@ -382,6 +390,16 @@ async def bottom_center_on_table(robot: RobotClient, box: Box, intr: Intrinsics,
     if t <= 0:
         raise RuntimeError("table intersection is behind the camera; check camera orientation")
     return origin.x + t * dx, origin.y + t * dy, pixel
+
+
+def apply_radial_correction(x: float, y: float) -> tuple[float, float]:
+    """Move the target away from the arm base by the measured fixed miss."""
+    radius = math.hypot(x, y)
+    if radius < 1e-6:
+        raise RuntimeError("cannot apply radial correction at the arm-base origin")
+    scale = RADIAL_OUTWARD_CORRECTION_MM / radius
+    outward_x, outward_y = x + x * scale, y + y * scale
+    return outward_x + LATERAL_X_CORRECTION_MM, outward_y
 
 
 @dataclass
@@ -648,10 +666,14 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         if intr is None:
             raise RuntimeError("camera intrinsics unavailable; no arm motion sent")
         # The locked frame and box must be used before moving the wrist camera.
-        x, y, pixel = await bottom_center_on_table(robot, box, intr, frame_w, frame_h)
+        raw_x, raw_y, pixel = await bottom_center_on_table(robot, box, intr, frame_w, frame_h)
+        x, y = apply_radial_correction(raw_x, raw_y)
         radius = math.hypot(x, y)
         print(f"[pick] selected {box.label!r}; bottom-center pixel=({pixel[0]:.1f}, {pixel[1]:.1f})")
-        print(f"[pick] table-plane world x={x:.1f} y={y:.1f} mm; radius={radius:.1f} mm")
+        print(f"[pick] raw table-plane x={raw_x:.1f} y={raw_y:.1f} mm; applying "
+              f"{RADIAL_OUTWARD_CORRECTION_MM:.1f} mm outward and "
+              f"{LATERAL_X_CORRECTION_MM:.1f} mm X -> x={x:.1f} y={y:.1f} mm; "
+              f"radius={radius:.1f} mm")
         if not MIN_TARGET_RADIUS_MM <= radius <= MAX_TARGET_RADIUS_MM:
             raise RuntimeError(f"target radius {radius:.1f} mm is outside the safe "
                                f"{MIN_TARGET_RADIUS_MM:.0f}-{MAX_TARGET_RADIUS_MM:.0f} mm workspace")
