@@ -249,26 +249,36 @@ def face_bbox_normalized(landmarks) -> tuple[float, float, float, float]:
     return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
 
 
-def evaluate_framing(bbox) -> tuple[str, bool]:
+def evaluate_framing(bbox, relaxed: bool = False) -> tuple[str, bool]:
+    """Check whether the face is suitably framed for calibration.
+
+    ``relaxed`` is the normal laptop-webcam mode: it accepts a complete face
+    farther from the camera.  The stricter mode remains available for callers
+    that specifically need a close eye crop.
+    """
     left, top, right, bottom = bbox
     face_cx, face_cy, face_h = (left + right) / 2, (top + bottom) / 2, bottom - top
     dx, dy = face_cx - FRAME_TARGET_CX, face_cy - FRAME_TARGET_CY
-    size_ratio = face_h / FRAME_TARGET_H
-    if abs(dx) > FRAME_POSITION_TOLERANCE:
+    target_h = 0.46 if relaxed else FRAME_TARGET_H
+    position_tolerance = 0.11 if relaxed else FRAME_POSITION_TOLERANCE
+    low, high = (0.65, 1.65) if relaxed else (FRAME_SIZE_RATIO_LOW, FRAME_SIZE_RATIO_HIGH)
+    size_ratio = face_h / target_h
+    if abs(dx) > position_tolerance:
         return ("move_left" if dx > 0 else "move_right"), False
-    if abs(dy) > FRAME_POSITION_TOLERANCE:
+    if abs(dy) > position_tolerance:
         return ("move_up" if dy > 0 else "move_down"), False
-    if size_ratio < FRAME_SIZE_RATIO_LOW:
+    if size_ratio < low:
         return "move_closer", False
-    if size_ratio > FRAME_SIZE_RATIO_HIGH:
+    if size_ratio > high:
         return "move_back", False
     return "aligned", True
 
 
-def draw_id_frame(canvas, aligned: bool) -> None:
+def draw_id_frame(canvas, aligned: bool, relaxed: bool = False) -> None:
     height, width = canvas.shape[:2]
     center = (int(FRAME_TARGET_CX * width), int(FRAME_TARGET_CY * height))
-    axes = (int(FRAME_TARGET_W * width / 2), int(FRAME_TARGET_H * height / 2))
+    target_h = 0.46 if relaxed else FRAME_TARGET_H
+    axes = (int(FRAME_TARGET_W * width / 2), int(target_h * height / 2))
     cv2.ellipse(canvas, center, axes, 0, 0, 360, (0, 200, 0) if aligned else (0, 165, 255), 3)
 
 
@@ -521,14 +531,21 @@ class DwellSelector:
 def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                      window_name: str = "Gaze Calibration",
                      keep_window: bool = False,
-                     quick: bool = False) -> GazeCalibration:
+                     quick: bool = False,
+                     simple_nine_point: bool = False,
+                     full_face: bool = False,
+                     relaxed_framing: bool = False) -> GazeCalibration:
     """Framing gate -> for each head pose (straight, left, right, up, down):
-    turn-and-hold -> pre-roll on the center dot -> 9 targets. quick=True does
-    the straight stage only (fine if the head will stay still).
+    turn-and-hold -> pre-roll on the center dot -> targets. quick=True does
+    the straight stage only (fine if the head will stay still).  The simple
+    nine-point mode is intended for this project's fixed-head laptop setup.
 
     Keys during calibration: S skips the current head-pose stage, Q/ESC cancels.
     """
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    # Use one normal OpenCV window and make it fullscreen here as well as in
+    # main2.py, so calibration cannot briefly reopen as a smaller window.
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     stages = HEAD_STAGES[:1] if quick else HEAD_STAGES
 
     def finish_window():
@@ -564,7 +581,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
             hold_started = 0.0
             message = "Face not found. Center your face in the frame."
         else:
-            status, aligned = evaluate_framing(face_bbox_normalized(landmarks))
+            status, aligned = evaluate_framing(face_bbox_normalized(landmarks), relaxed_framing)
             if aligned:
                 if hold_started == 0.0:
                     hold_started = now
@@ -577,7 +594,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                 hold_started = 0.0
                 message = FRAME_MESSAGES[status]
         source = frame if frame is not None else np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-        draw_id_frame(source, aligned)
+        draw_id_frame(source, aligned, relaxed_framing)
         canvas = face_canvas(source)
         _draw_status(canvas, message)
         show(canvas)
@@ -598,7 +615,8 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
 
     for stage_idx, (name, instruction, required, extra) in enumerate(stages):
         stage_label = f"Head {stage_idx + 1}/{len(stages)}: {name}"
-        grid = grid_targets(TURNED_GRID_N if required else STRAIGHT_GRID_N)
+        grid = grid_targets(3 if simple_nine_point and not required
+                            else (TURNED_GRID_N if required else STRAIGHT_GRID_N))
         # Center first, then the stage's extra interior point(s) (a short hop
         # from the center), then the grid ring(s).
         targets = [grid[0], *[p for p in extra if p not in grid], *grid[1:]]
@@ -655,7 +673,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
         t0 = time.monotonic()
         while time.monotonic() - t0 < CAL_PREROLL_S:
             frame, landmarks, _, _ = tracker.read()
-            canvas = eyes_canvas(frame, landmarks)
+            canvas = face_canvas(frame) if full_face else eyes_canvas(frame, landmarks)
             _draw_target(canvas, (cx, cy), 0.0, settling=True)
             _draw_status(canvas, f"{stage_label} - keep your head there, follow the dot with your eyes only")
             show(canvas)
@@ -676,7 +694,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                     capture_started = capture_started or now
                     if feats is not None and fully_open:
                         samples.append(feats)
-                canvas = eyes_canvas(frame, landmarks)
+                canvas = face_canvas(frame) if full_face else eyes_canvas(frame, landmarks)
                 _draw_target(canvas, (px, py), min(1.0, len(samples) / CAL_TARGET_SAMPLES), settling)
                 if blinking:
                     cv2.circle(canvas, (px, py), 34, (0, 120, 255), 2, cv2.LINE_AA)

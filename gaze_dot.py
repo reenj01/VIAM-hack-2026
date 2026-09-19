@@ -20,7 +20,9 @@ import numpy as np
 
 WINDOW_NAME = "Gaze dot prototype"
 MODEL_PATH = Path(__file__).with_name("face_landmarker.task")
-CAMERA_INDEX = 1
+# macOS currently reports only the built-in laptop webcam, which is device 0.
+# viam_scene_select.py imports this same setting for its calibration camera.
+CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CALIBRATION_SECONDS = 1.5

@@ -18,7 +18,6 @@ import os
 from dotenv import load_dotenv
 from viam.components.gripper import Gripper
 from viam.components.switch import Switch
-from viam.errors import ResourceNotFoundError
 from viam.proto.common import Pose, PoseInFrame
 from viam.robot.client import RobotClient
 from viam.services.motion import MotionClient
@@ -34,7 +33,6 @@ CAMERA_NAME = os.getenv("VIAM_CAMERA_NAME", "cam")
 GRIPPER_NAME = os.getenv("VIAM_GRIPPER_NAME", "gripper")
 VISION_NAME = os.getenv("VIAM_SEGMENTER_NAME", "objects-3d")
 MOTION_NAME = os.getenv("VIAM_MOTION_NAME", "builtin")
-TARGET_LABEL = os.getenv("VIAM_TUTORIAL_TARGET_LABEL", "rectangle-red").casefold()
 
 # Pose savers configured in the Viam app. In this project, pose-observe is
 # the tutorial's fixed camera-viewing "home" pose.
@@ -72,8 +70,8 @@ def offset_pose(pose: Pose, z_offset_mm: float) -> Pose:
     )
 
 
-async def detect_target_object(vision: VisionClient) -> PoseInFrame | None:
-    """Find the configured shape-detector label in the tutorial's 3-D output."""
+async def detect_largest_object(vision: VisionClient) -> PoseInFrame | None:
+    """Use the tutorial's selection rule: largest point cloud wins."""
     objects = await vision.get_object_point_clouds(CAMERA_NAME, timeout=90)
     if not objects:
         print("No objects detected.")
@@ -84,19 +82,7 @@ async def detect_target_object(vision: VisionClient) -> PoseInFrame | None:
         print("Objects were returned, but none included a usable geometry.")
         return None
 
-    matching_objects = [
-        obj
-        for obj in objects_with_geometry
-        if obj.geometries.geometries[0].label.casefold() == TARGET_LABEL
-    ]
-    if not matching_objects:
-        labels = [obj.geometries.geometries[0].label for obj in objects_with_geometry]
-        print(f"No {TARGET_LABEL!r} detected. Available shape labels: {labels}")
-        return None
-
-    # If two matching blocks are visible, use the one with the most depth
-    # points, which is the same selection rule used by the tutorial.
-    obj = max(matching_objects, key=lambda candidate: len(candidate.point_cloud))
+    obj = max(objects_with_geometry, key=lambda candidate: len(candidate.point_cloud))
     geometry = obj.geometries.geometries[0]
     print(f"Detected: {geometry.label}")
     print(
@@ -119,20 +105,10 @@ async def main(stage: str) -> None:
     # Check the two fixed placement switches before moving toward a detected
     # object. A missing resource should fail while the arm is still parked.
     if stage == "full":
-        try:
-            travel = Switch.from_robot(machine, TRAVEL_SWITCH_NAME)
-            place_pose = Switch.from_robot(machine, PLACE_SWITCH_NAME)
-            await travel.get_position()
-            await place_pose.get_position()
-        except ResourceNotFoundError as error:
-            raise RuntimeError(
-                "The full tutorial sequence needs two saved arm-position-saver switches that "
-                f"are not configured: {TRAVEL_SWITCH_NAME!r} and/or {PLACE_SWITCH_NAME!r}. "
-                "In the Viam Configure tab, add two copies of the same arm-position-saver "
-                "model used for pose-home and pose-observe, save safe travel and place poses "
-                "with switch position 1, then retry --stage full. Until then, use --stage "
-                "detect or --stage approach."
-            ) from error
+        travel = Switch.from_robot(machine, TRAVEL_SWITCH_NAME)
+        place_pose = Switch.from_robot(machine, PLACE_SWITCH_NAME)
+        await travel.get_position()
+        await place_pose.get_position()
 
     try:
         # Wrist-camera rule: detect only from this saved, repeatable pose.
@@ -140,7 +116,7 @@ async def main(stage: str) -> None:
         await observe.set_position(2)
         await asyncio.sleep(0.5)
 
-        obj_in_cam = await detect_target_object(vision)
+        obj_in_cam = await detect_largest_object(vision)
         if obj_in_cam is None:
             return
 
@@ -168,7 +144,6 @@ async def main(stage: str) -> None:
         # coordinates exactly as the tutorial prescribes.
         await gripper.open()
         await asyncio.sleep(0.3)
-        input("Press Enter to descend and grab rectangle-red, or Ctrl-C to abort: ")
         await motion.move(
             component_name=GRIPPER_NAME,
             destination=PoseInFrame(
@@ -186,10 +161,6 @@ async def main(stage: str) -> None:
             return
         await asyncio.sleep(0.3)
 
-        if stage == "grab":
-            print("rectangle-red is grasped. The arm is holding position; no place move was sent.")
-            return
-
         await travel.set_position(2)
         await place_pose.set_position(2)
         await gripper.open()
@@ -203,8 +174,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Viam Phase 5 pick-and-place flow.")
     parser.add_argument(
         "--stage",
-        choices=["detect", "approach", "grab", "full"],
+        choices=["detect", "approach", "full"],
         default="detect",
-        help="Start with detect, then approach; grab stops after closing; full needs travel/place switches.",
+        help="Start with detect, then approach; full also requires saved travel/place switches.",
     )
     asyncio.run(main(parser.parse_args().stage))
