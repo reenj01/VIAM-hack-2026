@@ -4,7 +4,7 @@
 
 Checks the resource names, the camera and its intrinsics, whether the detector
 can capture image + boxes together, the segmenter's 3D objects AND where each
-one lands in world coordinates (PASS/FAIL against the table), the gripper, and
+one lands in world coordinates (a coarse workspace check), the gripper, and
 the gripper/TCP geometry main.py will use. Run it with the arm parked at the
 pose you observe from, with an object on the table.
 """
@@ -12,6 +12,8 @@ pose you observe from, with an object on the table.
 import asyncio
 import math
 import time
+
+from grpclib import GRPCError, Status
 
 from viam.components.arm import Arm
 from viam.components.camera import Camera
@@ -28,12 +30,17 @@ from main import (
 )
 
 
-async def step(title, coro):
+async def step(title, coro, failures=None):
     print(f"\n== {title}")
     try:
-        return await coro
+        result = await coro
+        if result is False and failures is not None:
+            failures.append(title)
+        return result
     except Exception as e:
         print(f"   FAILED: {type(e).__name__}: {e}")
+        if failures is not None:
+            failures.append(title)
         return None
 
 
@@ -43,15 +50,18 @@ def motion_name(have: set[str]):
 
 async def check_names(machine):
     have = {r.name for r in machine.resource_names}
+    complete = True
     print("   resources on the machine:")
     for r in sorted(machine.resource_names, key=lambda r: (r.type, r.subtype, r.name)):
         print(f"     {r.type}:{r.subtype}/{r.name}")
     for role, name in (("camera", CAMERA_NAME), ("detector", DETECTOR_NAME), ("segmenter", SEGMENTER_NAME),
                        ("gripper", GRIPPER_NAME), ("arm", ARM_NAME)):
         status = "OK" if name in have else "NOT FOUND -> fix this name at the top of main.py"
+        complete = complete and name in have
         print(f"   {role:9} '{name}': {status}")
     mn = motion_name(have)
     print(f"   motion    '{mn}': OK" if mn else f"   motion: NOT FOUND ('{MOTION_SERVICE_NAME}' or 'builtin')")
+    return complete and mn is not None
 
 
 async def check_camera(machine):
@@ -61,6 +71,8 @@ async def check_camera(machine):
         print(f"   image '{img.name}' {img.mime_type} {img.width}x{img.height}")
     frame = decode_color_frame(images)
     print("   color frame:", "NONE (nothing decoded)" if frame is None else f"{frame.shape[1]}x{frame.shape[0]}")
+    if frame is None:
+        raise RuntimeError("Camera returned no decodable color frame")
     intr = await get_intrinsics(cam)
     if intr:
         print(f"   intrinsics: fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.cx:.1f} cy={intr.cy:.1f} "
@@ -70,7 +82,7 @@ async def check_camera(machine):
     return intr
 
 
-async def check_detector(machine, name):
+async def check_detector(machine, name, failures=None):
     det = VisionClient.from_robot(machine, name)
     dets = await det.get_detections_from_camera(CAMERA_NAME)
     print(f"   {len(dets)} detection(s)")
@@ -81,12 +93,18 @@ async def check_detector(machine, name):
             t0 = time.monotonic()
             res = await det.capture_all_from_camera(CAMERA_NAME, return_image=True, return_detections=True)
             frame = decode_viam_image(res.image)
+            if frame is None:
+                raise RuntimeError("Combined capture returned no decodable image")
             print(f"   combined capture: OK in {time.monotonic() - t0:.2f}s, image "
                   f"{'decoded' if frame is not None else 'NOT decodable'}, {len(res.detections or [])} detection(s)"
                   "  <- image and boxes come from the same frame")
         except Exception as e:
-            print(f"   combined capture: NOT SUPPORTED ({type(e).__name__}) -> main.py falls back to separate "
-                  "image + detection calls")
+            if isinstance(e, GRPCError) and e.status == Status.UNIMPLEMENTED:
+                print("   combined capture: UNIMPLEMENTED -> main.py falls back to separate image + detection calls")
+            else:
+                print(f"   combined capture: FAILED ({type(e).__name__}: {e}); support could not be verified")
+                if failures is not None:
+                    failures.append(f"Detector '{name}' combined capture")
     return {d.class_name for d in dets}
 
 
@@ -97,20 +115,21 @@ async def check_segmenter(machine, detector_labels, intr):
     print(f"   {len(objs)} 3D object(s) in {time.monotonic() - t0:.1f}s")
     seg_labels = {object_label(o) for o in objs} - {""}
     if seg_labels:
-        matched = [n for n, ls in detector_labels.items() if seg_labels & ls]
-        if DETECTOR_NAME in matched:
-            print(f"   labels match '{DETECTOR_NAME}' -> objects-3d is wired to the detector main.py uses")
-        elif matched:
-            print(f"   WARNING: labels match {matched}, not '{DETECTOR_NAME}'. Set objects-3d's detector_name "
-                  f"to '{DETECTOR_NAME}' in the Viam app (or run main.py --detector {matched[0]})")
+        valid_labels = {n: labels for n, labels in detector_labels.items() if labels is not None}
+        if detector_labels.get(DETECTOR_NAME) is None:
+            print(f"   detector comparison: SKIPPED; '{DETECTOR_NAME}' did not return a successful result")
         else:
-            print(f"   WARNING: labels {sorted(seg_labels)} match no detector's current labels")
+            matched = [n for n, labels in valid_labels.items() if seg_labels & labels]
+            print(f"   segmenter labels: {sorted(seg_labels)}; overlap with successful detector results: {matched or 'none'}")
+            print("   Label overlap does not verify segmenter wiring; these calls also capture different frames. "
+                  "Check detector_name in the segmenter's configuration to verify its source.")
     verdicts = []
     for i, o in enumerate(objs):
         cs = object_center_and_size(o)
         ref = object_reference_frame(o)
         if cs is None:
             print(f"     [{i}] '{object_label(o)}' frame='{ref}' (no geometry)")
+            verdicts.append(False)
             continue
         c, s = cs
         w = await pose_in(machine, Pose(x=c.x, y=c.y, z=c.z, o_z=1.0), ref, MOTION_REFERENCE_FRAME)
@@ -125,11 +144,13 @@ async def check_segmenter(machine, detector_labels, intr):
               f"({w.x:.0f}, {w.y:.0f}, {w.z:.0f})  size {s[0]:.0f}x{s[1]:.0f}x{s[2]:.0f}{pix}  "
               + ("PASS" if problem is None else f"FAIL: {problem}"))
     if verdicts:
-        print(f"   world-transform check: {'PASS' if all(verdicts) else 'FAIL'} "
-              f"(objects should sit on the table, top at z~{TABLE_TOP_Z_MM:.0f}, within reach). "
-              "The pixel column should match where YOLO boxed the object.")
+        print(f"   coarse workspace range check: {'PASS' if all(verdicts) else 'FAIL'} "
+              f"(configured table top z~{TABLE_TOP_Z_MM:.0f} mm). "
+              "This does not validate camera calibration, mounting transforms, or grasp accuracy. "
+              "Compare the pixel column with the object boxes and world positions with measured locations.")
     else:
-        print("   put an object on the table in view and re-run to verify the camera->world transform")
+        print("   INCOMPLETE: no usable 3D objects; put an object on the table in view and re-run")
+    return bool(verdicts) and all(verdicts)
 
 
 async def check_gripper(machine):
@@ -153,7 +174,7 @@ async def check_motion(machine):
     mn = motion_name({r.name for r in machine.resource_names})
     if mn is None:
         print("   no motion service found")
-        return
+        return False
     mo = MotionClient.from_robot(machine, mn)
     p = (await mo.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME)).pose
     print(f"   motion service '{mn}'")
@@ -169,22 +190,36 @@ async def check_motion(machine):
 
 
 async def main():
-    machine = await connect()
+    failures = []
+    machine = await step("Connection", connect(), failures)
+    if machine is None:
+        print("\n== Preflight FAILED: connection could not be established")
+        return 1
     try:
-        await step("Resource names", check_names(machine))
-        intr = await step("Camera", check_camera(machine))
+        await step("Resource names", check_names(machine), failures)
+        intr = await step("Camera", check_camera(machine), failures)
         have = {r.name for r in machine.resource_names}
         detector_labels = {}
         for name in dict.fromkeys((DETECTOR_NAME, *DETECTOR_CANDIDATES)):
             if name in have:
                 tag = " (the one main.py uses)" if name == DETECTOR_NAME else ""
-                detector_labels[name] = await step(f"Detector '{name}'{tag}", check_detector(machine, name)) or set()
-        await step("3D segmenter -> world", check_segmenter(machine, detector_labels, intr))
-        await step("Gripper", check_gripper(machine))
-        await step("Motion / gripper geometry", check_motion(machine))
+                essential_failures = failures if name == DETECTOR_NAME else None
+                detector_labels[name] = await step(
+                    f"Detector '{name}'{tag}", check_detector(machine, name, essential_failures), essential_failures
+                )
+        await step("3D segmenter -> world", check_segmenter(machine, detector_labels, intr), failures)
+        await step("Gripper", check_gripper(machine), failures)
+        await step("Motion / gripper geometry", check_motion(machine), failures)
     finally:
         await machine.close()
+    if failures:
+        print(f"\n== Preflight FAILED: {len(failures)} essential check(s) failed or incomplete")
+        for title in failures:
+            print(f"   - {title}")
+        return 1
+    print("\n== Preflight PASS: essential checks completed. Physical geometry and picking accuracy remain unverified.")
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))
