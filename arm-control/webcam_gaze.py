@@ -1,27 +1,32 @@
 """Reusable webcam gaze tracker.
 
-The feature extraction, calibration math, and the face-framing gate are ported
-directly from gaze_dot.py at the repo root, which the team tested and found
-accurate. This module wraps that same algorithm in a class so it can be
-driven frame-by-frame from another program's loop, and adds gaze smoothing,
-blink detection, and dwell timing on top (gaze_dot.py only draws a cursor
-dot; it has no selection logic).
+Built on MediaPipe's pretrained FaceLandmarker (no training here). Per-user
+calibration is a small ridge regression from eye + head-pose features to
+window pixels, fit at startup.
 
-Unlike gaze_dot.py's standalone script, calibration here targets the pixel
-space of whatever window you tell it to calibrate against (e.g. the window
-showing the RealSense feed), so gaze coordinates land directly in the same
-pixel space as the video you're hit-testing against. Calibrate and run in the
-SAME window, at the same screen position: the mapping is to pixels on your
-physical screen, so moving the window afterwards shifts everything.
-
-No training on an eye dataset happens here or in gaze_dot.py: the MediaPipe
-face/iris model is pretrained, and calibration is a small per-user ridge
-regression fit at startup.
+Design notes:
+- Features: each iris's position inside its own eye (along the eye's own
+  corner-to-corner axis, in units of eye width), plus head yaw/pitch proxies
+  (nose tip relative to the eye midpoint, in units of inter-eye distance),
+  plus their products. When the head turns left while the eyes stay on the
+  same screen point, the irises rotate right inside the head; only a model
+  that sees BOTH can tell that apart from actually looking right.
+- Calibration therefore runs in stages: head straight, then turned left,
+  right, up, down, with the 9 targets at each. One stage would leave the head
+  features constant and their weights arbitrary (the "move your head and the
+  dot jumps" failure). --quick-calibration = straight only.
+- Blinks: per-user threshold from an open-eye baseline; blink frames are
+  skipped while calibrating, and live the cursor holds until the eyes are
+  fully open again for a moment (the reopening lids corrupt the iris fit).
+- Out-of-range predictions (head far outside the calibrated range) return
+  None rather than a point pinned to the screen edge.
+- Calibrate and run in the SAME window at the same screen position.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,35 +40,110 @@ from mediapipe.tasks.python.core.base_options import BaseOptions
 
 MODEL_PATH = Path(__file__).parent / "models" / "face_landmarker.task"
 CALIBRATION_PATH = Path(__file__).parent / "webcam_gaze_calibration.json"
+CALIBRATION_VERSION = 3   # bump when the feature vector changes
 
 # MediaPipe FaceLandmarker's 478-point mesh: 468-472 = right iris, 473-477 = left iris.
 RIGHT_IRIS = [468, 469, 470, 471, 472]
 LEFT_IRIS = [473, 474, 475, 476, 477]
 LEFT_EYE_CORNERS = (33, 133)
 RIGHT_EYE_CORNERS = (362, 263)
-# Vertical lid points, used only for blink detection (not part of gaze_dot.py's
-# original feature set).
 RIGHT_LID = (159, 145)
 LEFT_LID = (386, 374)
+NOSE_TIP = 1
+LEFT_EYE_LANDMARKS = [*LEFT_IRIS, *LEFT_EYE_CORNERS, *LEFT_LID]
+RIGHT_EYE_LANDMARKS = [*RIGHT_IRIS, *RIGHT_EYE_CORNERS, *RIGHT_LID]
 
-# Same capture size as gaze_dot.py: more pixels on the eyes = steadier iris landmarks.
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 
-BLINK_EAR_THRESHOLD = 0.17
+BLINK_EAR_THRESHOLD = 0.17        # fallback if no per-user baseline was measured
+BLINK_BASELINE_FRACTION = 0.65    # blink: EAR below this fraction of the open-eye baseline
+OPEN_BASELINE_FRACTION = 0.85     # fully open again: EAR back above this fraction...
+REOPEN_HOLD_S = 0.08              # ...and held there this long before predictions resume
 DWELL_SECONDS = 0.9
-DWELL_GRACE_SECONDS = 0.35   # a brief gaze wobble outside the box doesn't reset the dwell
-SMOOTHING = 0.80             # EMA weight on the previous gaze point (same as gaze_dot.py)
+DWELL_GRACE_SECONDS = 0.35
+SMOOTHING = 0.80
+RIDGE_LAMBDA = 0.05               # on standardized features
+OUT_OF_RANGE_MARGIN = 0.15        # prediction beyond the window by more than this fraction -> None
 
-CALIBRATION_TARGETS = [
-    (0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
-    (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
-    (0.15, 0.85), (0.50, 0.85), (0.85, 0.85),
+# Calibration targets: an n x n grid inside CAL_MARGIN, ordered center first,
+# then ring by ring outward, each ring walked around its perimeter (short hops).
+CAL_MARGIN = 0.15
+STRAIGHT_GRID_N = 5   # the head pose used most: dense, so mid-diagonals and interior points are measured
+TURNED_GRID_N = 3     # turned stages only teach the head/eye coupling; 3x3 is enough
+
+
+def grid_targets(n: int) -> list[tuple[float, float]]:
+    levels = np.linspace(CAL_MARGIN, 1 - CAL_MARGIN, n)
+    c = (n - 1) / 2
+    pts = []
+    for iy in range(n):
+        for ix in range(n):
+            ring = max(abs(ix - c), abs(iy - c))
+            angle = math.atan2(ix - c, -(iy - c)) % (2 * math.pi)   # 0 = top of the ring, clockwise
+            pts.append((ring, angle, (float(levels[ix]), float(levels[iy]))))
+    pts.sort(key=lambda t: (t[0], t[1]))
+    return [p for _, _, p in pts]
+
+
+CALIBRATION_TARGETS = grid_targets(TURNED_GRID_N)
+# Head-pose stages: (name, instruction, {axis: (direction, minimum |change| from
+# the straight pose)}, extra targets). Diagonals need both axes moved. The extra
+# targets are the interior midpoint(s) on the side the head is turned toward
+# (halfway from the center to that edge or corner): the 3x3 grid never samples
+# them, and when the head faces that region the eyes are near neutral there.
+# Add more tuples to a stage's list to sample its region denser.
+YAW_STEP, PITCH_STEP = 0.10, 0.06
+NEAR, MID, FAR = 0.325, 0.5, 0.675   # the 5x5 grid's interior levels
+LEFT, RIGHT, UP, DOWN = ("yaw", ("left", YAW_STEP)), ("yaw", ("right", YAW_STEP)), \
+    ("pitch", ("up", PITCH_STEP)), ("pitch", ("down", PITCH_STEP))
+HEAD_STAGES = [
+    ("straight", "Face the screen straight on", {}, []),
+    ("left", "Turn your head a little to the LEFT and hold it there", dict([LEFT]), [(NEAR, MID)]),
+    ("right", "Turn your head a little to the RIGHT and hold it there", dict([RIGHT]), [(FAR, MID)]),
+    ("up", "Tilt your head a little UP and hold it there", dict([UP]), [(MID, NEAR)]),
+    ("down", "Tilt your head a little DOWN and hold it there", dict([DOWN]), [(MID, FAR)]),
+    ("up-left", "Turn a little LEFT and tilt a little UP, and hold it there", dict([LEFT, UP]), [(NEAR, NEAR)]),
+    ("up-right", "Turn a little RIGHT and tilt a little UP, and hold it there", dict([RIGHT, UP]), [(FAR, NEAR)]),
+    ("down-left", "Turn a little LEFT and tilt a little DOWN, and hold it there", dict([LEFT, DOWN]), [(NEAR, FAR)]),
+    ("down-right", "Turn a little RIGHT and tilt a little DOWN, and hold it there", dict([RIGHT, DOWN]), [(FAR, FAR)]),
 ]
+OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
 
-# ID-photo-style framing gate, run once before the 9-point calibration starts
-# (from gaze_dot.py). Keeps the face centered and at a consistent distance so
-# the calibration is taken from the same head position it will be used from.
+
+def expected_sign(learned: dict[str, float], direction: str) -> Optional[float]:
+    """Which sign of the head-pose proxy means `direction`. The first stage on
+    each axis defines it (the proxy's sign convention depends on the mirrored
+    camera image), then the opposite and diagonal stages must match it."""
+    if direction in learned:
+        return learned[direction]
+    if OPPOSITE[direction] in learned:
+        return -learned[OPPOSITE[direction]]
+    return None
+
+
+def head_stage_progress(required: dict, deltas: dict[str, float],
+                        learned: dict[str, float]) -> tuple[float, bool]:
+    """(fraction of the way to the required pose, 1 = there; turned the wrong way)."""
+    fractions, wrong_way = [], False
+    for axis, (direction, step) in required.items():
+        want = expected_sign(learned, direction)
+        d = deltas[axis]
+        if want is not None and d * want < 0:
+            wrong_way = True
+            fractions.append(0.0)
+        else:
+            fractions.append(abs(d) / step)
+    return min(fractions), wrong_way
+HEAD_HOLD_S = 0.8          # head must be turned enough and steady this long before a stage starts
+HEAD_MAX_WAIT_S = 12.0     # ...or the stage starts anyway with whatever pose is held
+CAL_PREROLL_S = 0.6
+CAL_SETTLE_S = 0.45
+CAL_MIN_SAMPLES = 8
+CAL_TARGET_SAMPLES = 12
+CAL_MAX_CAPTURE_S = 2.0
+
+# Face-framing gate (from gaze_dot.py).
 FRAME_TARGET_CX = 0.50
 FRAME_TARGET_CY = 0.45
 FRAME_TARGET_W = 0.34
@@ -87,90 +167,93 @@ def _landmark_xy(landmarks, index: int) -> np.ndarray:
     return np.array([point.x, point.y], dtype=np.float64)
 
 
+def _eye_local(iris: np.ndarray, corner_a: np.ndarray, corner_b: np.ndarray) -> tuple[float, float]:
+    """Iris offset from the eye's center along the eye's own axis / perpendicular, in eye widths."""
+    axis = corner_b - corner_a
+    width = max(float(np.linalg.norm(axis)), 1e-5)
+    u = axis / width
+    v = np.array([-u[1], u[0]])
+    rel = iris - (corner_a + corner_b) / 2
+    return float(np.dot(rel, u) / width), float(np.dot(rel, v) / width)
+
+
+def head_pose_proxies(landmarks) -> tuple[float, float]:
+    """Yaw/pitch proxies: nose tip relative to the eye midpoint, in inter-eye
+    distances. Turning left/right moves the nose sideways; tilting up/down
+    moves it toward/away from the eyes. Position- and scale-invariant."""
+    la, lb = (_landmark_xy(landmarks, i) for i in LEFT_EYE_CORNERS)
+    ra, rb = (_landmark_xy(landmarks, i) for i in RIGHT_EYE_CORNERS)
+    left_c, right_c = (la + lb) / 2, (ra + rb) / 2
+    mid = (left_c + right_c) / 2
+    axis = right_c - left_c
+    eye_dist = max(float(np.linalg.norm(axis)), 1e-5)
+    u = axis / eye_dist                      # along the eye line...
+    v = np.array([-u[1], u[0]])              # ...and perpendicular: roll-invariant like the iris features
+    rel = _landmark_xy(landmarks, NOSE_TIP) - mid
+    return float(np.dot(rel, u) / eye_dist), float(np.dot(rel, v) / eye_dist)
+
+
 def gaze_features(landmarks) -> Optional[np.ndarray]:
-    """Same feature vector as gaze_dot.py's gaze_features()."""
     try:
         left_iris = np.mean([_landmark_xy(landmarks, i) for i in LEFT_IRIS], axis=0)
         right_iris = np.mean([_landmark_xy(landmarks, i) for i in RIGHT_IRIS], axis=0)
-        left_inner, left_outer = (_landmark_xy(landmarks, i) for i in LEFT_EYE_CORNERS)
-        right_inner, right_outer = (_landmark_xy(landmarks, i) for i in RIGHT_EYE_CORNERS)
+        la, lb = (_landmark_xy(landmarks, i) for i in LEFT_EYE_CORNERS)
+        ra, rb = (_landmark_xy(landmarks, i) for i in RIGHT_EYE_CORNERS)
+        yaw, pitch = head_pose_proxies(landmarks)
     except IndexError:
         return None
-
-    left_width = max(np.linalg.norm(left_outer - left_inner), 1e-5)
-    right_width = max(np.linalg.norm(right_outer - right_inner), 1e-5)
-
-    left_center = (left_inner + left_outer) / 2
-    right_center = (right_inner + right_outer) / 2
-
-    left_relative = (left_iris - left_center) / left_width
-    right_relative = (right_iris - right_center) / right_width
-
-    face_center = (left_center + right_center) / 2
-    eye_distance = np.linalg.norm(right_center - left_center)
-
-    mean_x = (left_relative[0] + right_relative[0]) / 2
-    mean_y = (left_relative[1] + right_relative[1]) / 2
-
+    lx, ly = _eye_local(left_iris, la, lb)
+    rx, ry = _eye_local(right_iris, ra, rb)
+    mx, my = (lx + rx) / 2, (ly + ry) / 2
     return np.array([
-        left_relative[0], left_relative[1],
-        right_relative[0], right_relative[1],
-        mean_x, mean_y,
-        mean_x * mean_x, mean_y * mean_y, mean_x * mean_y,
-        face_center[0], face_center[1], eye_distance,
+        lx, ly, rx, ry, mx, my, mx * mx, my * my, mx * my,
+        yaw, pitch, yaw * mx, yaw * my, pitch * mx, pitch * my, yaw * yaw, pitch * pitch,
         1.0,
     ], dtype=np.float64)
 
 
-def eye_aspect_ratio(landmarks) -> float:
-    """Mean eye-aspect-ratio across both eyes; drops sharply on a blink."""
+N_FEATURES = 18
 
+
+def eye_aspect_ratio(landmarks) -> float:
     def ear(top_i, bottom_i, outer_i, inner_i):
         top, bottom = _landmark_xy(landmarks, top_i), _landmark_xy(landmarks, bottom_i)
         outer, inner = _landmark_xy(landmarks, outer_i), _landmark_xy(landmarks, inner_i)
-        vertical = np.linalg.norm(top - bottom)
-        horizontal = np.linalg.norm(outer - inner)
-        return vertical / (horizontal + 1e-6)
+        return np.linalg.norm(top - bottom) / (np.linalg.norm(outer - inner) + 1e-6)
 
-    r = ear(*RIGHT_LID, *RIGHT_EYE_CORNERS)
-    l = ear(*LEFT_LID, *LEFT_EYE_CORNERS)
-    return (r + l) / 2
+    return (ear(*RIGHT_LID, *RIGHT_EYE_CORNERS) + ear(*LEFT_LID, *LEFT_EYE_CORNERS)) / 2
 
 
-def fit_calibration(samples: list[np.ndarray], targets_px: list[np.ndarray]) -> np.ndarray:
-    """Same ridge-regularized fit as gaze_dot.py's fit_calibration()."""
+def fit_calibration(samples: list[np.ndarray], targets_px: list[np.ndarray],
+                    ridge_lambda: float = RIDGE_LAMBDA) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Ridge regression on standardized features (bias column untouched and
+    unpenalized). Returns (mapping, feature_mean, feature_std). A feature that
+    never varied during calibration gets std 1 and mean = its value, so it
+    contributes nothing instead of an arbitrary weight."""
     x = np.vstack(samples)
     y = np.vstack(targets_px)
-    regularization = 1e-3
-    return np.linalg.solve(x.T @ x + regularization * np.eye(x.shape[1]), x.T @ y)
-
-
-def calibration_error(samples, targets_px, mapping) -> float:
-    """Mean pixel error on the calibration points themselves."""
-    pred = np.vstack(samples) @ mapping
-    return float(np.mean(np.linalg.norm(pred - np.vstack(targets_px), axis=1)))
+    mean = x.mean(axis=0)
+    std = x.std(axis=0)
+    mean[-1], std[-1] = 0.0, 1.0
+    std[std < 1e-6] = 1.0
+    z = (x - mean) / std
+    reg = np.eye(z.shape[1]) * ridge_lambda
+    reg[-1, -1] = 0.0
+    mapping = np.linalg.solve(z.T @ z + reg, z.T @ y)
+    return mapping, mean, std
 
 
 def face_bbox_normalized(landmarks) -> tuple[float, float, float, float]:
-    """Bounding box (left, top, right, bottom) of all face landmarks, normalized [0, 1]."""
     xs = np.array([p.x for p in landmarks])
     ys = np.array([p.y for p in landmarks])
     return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
 
 
 def evaluate_framing(bbox) -> tuple[str, bool]:
-    """Compare the face bbox to the target oval and return (status_code, aligned)."""
     left, top, right, bottom = bbox
-    face_cx = (left + right) / 2
-    face_cy = (top + bottom) / 2
-    face_h = bottom - top
-
-    dx = face_cx - FRAME_TARGET_CX
-    dy = face_cy - FRAME_TARGET_CY
+    face_cx, face_cy, face_h = (left + right) / 2, (top + bottom) / 2, bottom - top
+    dx, dy = face_cx - FRAME_TARGET_CX, face_cy - FRAME_TARGET_CY
     size_ratio = face_h / FRAME_TARGET_H
-
-    # The frame is mirrored (selfie view), so on-screen directions read like a
-    # real mirror: face right-of-center on screen -> tell the user to move left.
     if abs(dx) > FRAME_POSITION_TOLERANCE:
         return ("move_left" if dx > 0 else "move_right"), False
     if abs(dy) > FRAME_POSITION_TOLERANCE:
@@ -186,12 +269,10 @@ def draw_id_frame(canvas, aligned: bool) -> None:
     height, width = canvas.shape[:2]
     center = (int(FRAME_TARGET_CX * width), int(FRAME_TARGET_CY * height))
     axes = (int(FRAME_TARGET_W * width / 2), int(FRAME_TARGET_H * height / 2))
-    color = (0, 200, 0) if aligned else (0, 165, 255)
-    cv2.ellipse(canvas, center, axes, 0, 0, 360, color, 3)
+    cv2.ellipse(canvas, center, axes, 0, 0, 360, (0, 200, 0) if aligned else (0, 165, 255), 3)
 
 
 def letterbox(frame, width: int, height: int) -> np.ndarray:
-    """Fit frame inside width x height keeping its aspect ratio, black bars around."""
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
     fh, fw = frame.shape[:2]
     scale = min(width / fw, height / fh)
@@ -201,46 +282,92 @@ def letterbox(frame, width: int, height: int) -> np.ndarray:
     return canvas
 
 
-def _draw_status(canvas, message: str) -> None:
-    cv2.rectangle(canvas, (10, 10), (min(canvas.shape[1] - 10, 900), 75), (0, 0, 0), -1)
-    cv2.putText(canvas, message, (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+def _crop_around(frame, landmarks, indices, margin: float) -> Optional[np.ndarray]:
+    h, w = frame.shape[:2]
+    pts = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in indices])
+    x0, y0 = pts.min(axis=0)
+    x1, y1 = pts.max(axis=0)
+    bw = max(x1 - x0, 1.0)
+    x0, x1 = int(max(0, x0 - margin * bw)), int(min(w, x1 + margin * bw))
+    y0, y1 = int(max(0, y0 - margin * bw)), int(min(h, y1 + margin * bw))
+    crop = frame[y0:y1, x0:x1]
+    return crop if crop.size else None
 
 
-def _draw_target(canvas, point_px, number: int, progress: float, settling: bool) -> None:
+EYE_CROP_MARGIN = 0.08   # fraction of the eye's width added around it; ~0 = just the eyeball
+
+
+def eyes_strip(frame, landmarks, height: int = 240) -> np.ndarray:
+    """Just the two eyeballs, each cropped tightly and shown side by side.
+    (Display only: the model uses landmark coordinates, never pixels, so the
+    background and the head outline don't reach it at all.)"""
+    crops = []
+    for indices in (RIGHT_EYE_LANDMARKS, LEFT_EYE_LANDMARKS):  # mirrored frame: right eye is on the left
+        c = _crop_around(frame, landmarks, indices, margin=EYE_CROP_MARGIN)
+        if c is not None:
+            scale = height / c.shape[0]
+            crops.append(cv2.resize(c, (max(1, int(c.shape[1] * scale)), height)))
+    if not crops:
+        return frame
+    gap = np.zeros((height, 24, 3), dtype=np.uint8)
+    return np.hstack([crops[0], gap, crops[1]]) if len(crops) == 2 else crops[0]
+
+
+def _draw_status(canvas, message: str, y_from_bottom: int = 24) -> None:
+    h = canvas.shape[0]
+    cv2.putText(canvas, message, (16, h - y_from_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(canvas, message, (16, h - y_from_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
+
+
+def _draw_target(canvas, point_px, progress: float, settling: bool) -> None:
     x, y = point_px
     color = (0, 165, 255) if settling else (0, 255, 255)
-    cv2.circle(canvas, (x, y), 24, color, 3)
-    cv2.circle(canvas, (x, y), max(1, int(20 * progress)), color, -1)
-    cv2.putText(canvas, str(number), (x - 8, y + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    cv2.circle(canvas, (x, y), 26, color, 3, cv2.LINE_AA)
+    cv2.circle(canvas, (x, y), max(2, int(20 * progress)), color, -1, cv2.LINE_AA)
+    cv2.circle(canvas, (x, y), 3, (0, 0, 0), -1, cv2.LINE_AA)
 
 
 @dataclass
 class GazeCalibration:
     mapping: np.ndarray
+    feat_mean: np.ndarray
+    feat_std: np.ndarray
     frame_w: int
     frame_h: int
+    blink_ear: float = BLINK_EAR_THRESHOLD
+    open_ear: float = BLINK_EAR_THRESHOLD * OPEN_BASELINE_FRACTION / BLINK_BASELINE_FRACTION
+    version: int = CALIBRATION_VERSION
 
-    def predict(self, feat: np.ndarray) -> tuple[float, float]:
-        pred = feat @ self.mapping
-        x = float(np.clip(pred[0], 0, self.frame_w - 1))
-        y = float(np.clip(pred[1], 0, self.frame_h - 1))
-        return x, y
+    def predict(self, feat: np.ndarray) -> Optional[tuple[float, float]]:
+        """Window pixel, or None when the prediction is far outside the window
+        (head outside the calibrated range) rather than a point pinned to an edge."""
+        pred = ((feat - self.feat_mean) / self.feat_std) @ self.mapping
+        mx, my = OUT_OF_RANGE_MARGIN * self.frame_w, OUT_OF_RANGE_MARGIN * self.frame_h
+        if not (-mx <= pred[0] <= self.frame_w + mx and -my <= pred[1] <= self.frame_h + my):
+            return None
+        return (float(np.clip(pred[0], 0, self.frame_w - 1)),
+                float(np.clip(pred[1], 0, self.frame_h - 1)))
 
     def save(self, path: Path = CALIBRATION_PATH) -> None:
         path.write_text(json.dumps({
-            "mapping": self.mapping.tolist(),
-            "frame_w": self.frame_w,
-            "frame_h": self.frame_h,
+            "version": self.version, "mapping": self.mapping.tolist(),
+            "feat_mean": self.feat_mean.tolist(), "feat_std": self.feat_std.tolist(),
+            "frame_w": self.frame_w, "frame_h": self.frame_h,
+            "blink_ear": self.blink_ear, "open_ear": self.open_ear,
         }))
 
     @classmethod
-    def load(cls, path: Path = CALIBRATION_PATH) -> "GazeCalibration":
+    def load(cls, path: Path = CALIBRATION_PATH) -> Optional["GazeCalibration"]:
+        """None if there is no saved calibration or it's from an older feature set."""
+        if not path.exists():
+            return None
         data = json.loads(path.read_text())
-        return cls(
-            mapping=np.array(data["mapping"]),
-            frame_w=data["frame_w"],
-            frame_h=data["frame_h"],
-        )
+        mapping = np.array(data.get("mapping", []))
+        if data.get("version") != CALIBRATION_VERSION or mapping.shape[:1] != (N_FEATURES,):
+            return None
+        return cls(mapping=mapping, feat_mean=np.array(data["feat_mean"]), feat_std=np.array(data["feat_std"]),
+                   frame_w=data["frame_w"], frame_h=data["frame_h"],
+                   blink_ear=float(data["blink_ear"]), open_ear=float(data["open_ear"]))
 
 
 class WebcamGazeTracker:
@@ -250,10 +377,8 @@ class WebcamGazeTracker:
                  width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT):
         if not model_path.exists():
             raise FileNotFoundError(f"Missing MediaPipe model at {model_path}")
-
-        base_options = BaseOptions(model_asset_path=str(model_path))
         options = vision.FaceLandmarkerOptions(
-            base_options=base_options,
+            base_options=BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             min_face_detection_confidence=0.6,
@@ -268,9 +393,8 @@ class WebcamGazeTracker:
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._start = time.monotonic()
         self._last_timestamp_ms = -1
-        # Camera warmup: auto-exposure can take several frames to settle.
         frame = None
-        for _ in range(15):
+        for _ in range(15):  # auto-exposure warmup
             _, frame = self._cap.read()
         got = f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "unknown"
         print(f"[gaze] webcam {camera_index} capturing at {got} (asked for {width}x{height})")
@@ -282,20 +406,15 @@ class WebcamGazeTracker:
             return None, None, None, None
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-
         timestamp_ms = int((time.monotonic() - self._start) * 1000)
         if timestamp_ms <= self._last_timestamp_ms:
             timestamp_ms = self._last_timestamp_ms + 1
         self._last_timestamp_ms = timestamp_ms
-
-        result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
+        result = self._landmarker.detect_for_video(Image(image_format=ImageFormat.SRGB, data=rgb), timestamp_ms)
         if not result.face_landmarks:
             return frame, None, None, None
         landmarks = result.face_landmarks[0]
-        feats = gaze_features(landmarks)
-        ear = eye_aspect_ratio(landmarks)
-        return frame, landmarks, feats, ear
+        return frame, landmarks, gaze_features(landmarks), eye_aspect_ratio(landmarks)
 
     def close(self):
         self._cap.release()
@@ -303,11 +422,13 @@ class WebcamGazeTracker:
 
 
 class GazeSmoother:
-    """Exponential moving average over the predicted gaze point."""
-
     def __init__(self, smoothing: float = SMOOTHING):
         self.smoothing = smoothing
         self._pt: Optional[np.ndarray] = None
+
+    @property
+    def last(self) -> Optional[tuple[float, float]]:
+        return None if self._pt is None else (float(self._pt[0]), float(self._pt[1]))
 
     def reset(self) -> None:
         self._pt = None
@@ -318,23 +439,63 @@ class GazeSmoother:
         return float(self._pt[0]), float(self._pt[1])
 
 
-def estimate_gaze(tracker: WebcamGazeTracker, calib: GazeCalibration,
-                  smoother: GazeSmoother) -> tuple[Optional[tuple[float, float]], Optional[float]]:
-    """One webcam frame -> (smoothed gaze point in window pixels or None, eye aspect ratio)."""
-    _, _, feats, ear = tracker.read()
-    if feats is None:
-        smoother.reset()
-        return None, ear
-    return smoother.update(calib.predict(feats)), ear
+class BlinkGate:
+    """Eyes count as open only once the aspect ratio is back above the open
+    level AND has stayed there for reopen_hold_s: the reopening lids corrupt
+    the iris fit for a few frames after a blink."""
+
+    def __init__(self, blink_ear: float, open_ear: float, reopen_hold_s: float = REOPEN_HOLD_S):
+        self.blink_ear, self.open_ear, self.reopen_hold_s = blink_ear, open_ear, reopen_hold_s
+        self._open_since: Optional[float] = None
+
+    def update(self, ear: Optional[float], now: Optional[float] = None) -> tuple[bool, bool]:
+        """Returns (eyes_fully_open, blinking_or_reopening)."""
+        now = time.monotonic() if now is None else now
+        if ear is None:
+            return False, False
+        if ear < self.open_ear:            # closed, or only part-way open
+            self._open_since = None
+            return False, True
+        if self._open_since is None:
+            self._open_since = now
+        if now - self._open_since < self.reopen_hold_s:
+            return False, True
+        return True, False
+
+
+class GazeEstimator:
+    """Live gaze: webcam frame -> window pixel, with blink holding and smoothing."""
+
+    def __init__(self, tracker: WebcamGazeTracker, calib: GazeCalibration):
+        self.tracker, self.calib = tracker, calib
+        self.smoother = GazeSmoother()
+        self.gate = BlinkGate(calib.blink_ear, calib.open_ear)
+        self.last_head: Optional[tuple[float, float]] = None   # head-pose proxies of the last frame read
+
+    def reset(self) -> None:
+        self.smoother.reset()
+
+    def read(self) -> tuple[Optional[tuple[float, float]], Optional[float], bool]:
+        """Returns (gaze point or None, eye aspect ratio, blinking/reopening)."""
+        _, landmarks, feats, ear = self.tracker.read()
+        self.last_head = head_pose_proxies(landmarks) if landmarks is not None else None
+        if feats is None:
+            self.smoother.reset()
+            return None, ear, False
+        fully_open, blinking = self.gate.update(ear)
+        if not fully_open:
+            return self.smoother.last, ear, True
+        pred = self.calib.predict(feats)
+        if pred is None:                   # out of the calibrated range: no point, no evidence
+            return None, ear, False
+        return self.smoother.update(pred), ear, False
 
 
 class DwellSelector:
-    """Tracks how long gaze has continuously hovered the same label."""
+    """Simple hover timer (gaze_lock.py's evidence model is what main.py uses)."""
 
-    def __init__(self, dwell_seconds: float = DWELL_SECONDS,
-                 grace_seconds: float = DWELL_GRACE_SECONDS):
-        self.dwell_seconds = dwell_seconds
-        self.grace_seconds = grace_seconds
+    def __init__(self, dwell_seconds: float = DWELL_SECONDS, grace_seconds: float = DWELL_GRACE_SECONDS):
+        self.dwell_seconds, self.grace_seconds = dwell_seconds, grace_seconds
         self._target: Optional[str] = None
         self._started_at: Optional[float] = None
         self._last_seen: Optional[float] = None
@@ -343,7 +504,6 @@ class DwellSelector:
         self._target, self._started_at, self._last_seen = None, None, None
 
     def update(self, hovered: Optional[str]) -> tuple[Optional[str], float]:
-        """Returns (selected_label_or_None, progress_0_to_1)."""
         now = time.monotonic()
         if hovered is None:
             if self._target is not None and now - self._last_seen <= self.grace_seconds:
@@ -355,47 +515,49 @@ class DwellSelector:
             return None, 0.0
         self._last_seen = now
         elapsed = now - self._started_at
-        if elapsed >= self.dwell_seconds:
-            return hovered, 1.0
-        return None, elapsed / self.dwell_seconds
+        return (hovered, 1.0) if elapsed >= self.dwell_seconds else (None, elapsed / self.dwell_seconds)
 
 
 def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                      window_name: str = "Gaze Calibration",
-                     settle_seconds: float = 0.5,
-                     hold_seconds: float = 1.5,
-                     min_samples_per_point: int = 10,
-                     keep_window: bool = False) -> GazeCalibration:
-    """Framing gate, then 9-point calibration, against a window of size (frame_w, frame_h).
+                     keep_window: bool = False,
+                     quick: bool = False) -> GazeCalibration:
+    """Framing gate -> for each head pose (straight, left, right, up, down):
+    turn-and-hold -> pre-roll on the center dot -> 9 targets. quick=True does
+    the straight stage only (fine if the head will stay still).
 
-    Same flow and timing as gaze_dot.py: center your face in the oval, hold
-    for a second, then each target is shown for settle + hold seconds and the
-    median of the samples collected after the settle window is kept.
-    Pass keep_window=True to leave the window open for the caller to reuse
-    (so the run happens at the exact screen position that was calibrated).
+    Keys during calibration: S skips the current head-pose stage, Q/ESC cancels.
     """
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    stages = HEAD_STAGES[:1] if quick else HEAD_STAGES
 
     def finish_window():
         if not keep_window:
             cv2.destroyWindow(window_name)
 
-    def show(canvas):
+    def show(canvas) -> int:
         cv2.imshow(window_name, canvas)
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):
             finish_window()
             raise SystemExit("Calibration cancelled")
+        return key
 
-    def webcam_canvas(frame):
+    def face_canvas(frame):
+        return letterbox(frame if frame is not None else np.zeros((frame_h, frame_w, 3), np.uint8), frame_w, frame_h)
+
+    def eyes_canvas(frame, landmarks):
         if frame is None:
             return np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-        return letterbox(frame, frame_w, frame_h)
+        src = eyes_strip(frame, landmarks) if landmarks is not None else frame
+        return (letterbox(src, frame_w, frame_h) * 0.55).astype(np.uint8)
 
-    # Phase 1: framing gate.
+    # Phase 1: framing gate, measuring the open-eye EAR baseline and the straight head pose.
     hold_started = 0.0
+    open_ears: list[float] = []
+    straight_poses: list[tuple[float, float]] = []
     while True:
-        frame, landmarks, _, _ = tracker.read()
+        frame, landmarks, _, ear = tracker.read()
         now = time.monotonic()
         aligned, remaining = False, 1.0
         if landmarks is None:
@@ -406,59 +568,142 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
             if aligned:
                 if hold_started == 0.0:
                     hold_started = now
+                if ear is not None:
+                    open_ears.append(ear)
+                straight_poses.append(head_pose_proxies(landmarks))
                 remaining = max(0.0, FRAME_HOLD_SECONDS - (now - hold_started))
-                message = "Hold still..." if remaining > 0 else "Starting calibration..."
+                message = "Hold still, eyes open, looking at the screen..." if remaining > 0 else "Starting..."
             else:
                 hold_started = 0.0
                 message = FRAME_MESSAGES[status]
-
-        # The oval goes on the raw webcam frame, so it sits in the same
-        # normalized space the face bbox is judged in, and is then letterboxed
-        # with the frame rather than stretched.
         source = frame if frame is not None else np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
         draw_id_frame(source, aligned)
-        canvas = webcam_canvas(source)
+        canvas = face_canvas(source)
         _draw_status(canvas, message)
         show(canvas)
         if aligned and remaining <= 0.0:
             break
 
-    # Phase 2: the nine targets.
+    baseline = float(np.median(open_ears)) if open_ears else None
+    blink_ear = min(0.24, max(0.10, BLINK_BASELINE_FRACTION * baseline)) if baseline else BLINK_EAR_THRESHOLD
+    open_ear = min(0.30, max(blink_ear + 0.02, OPEN_BASELINE_FRACTION * baseline)) if baseline else blink_ear + 0.03
+    yaw0, pitch0 = (np.median(np.array(straight_poses), axis=0) if straight_poses else (0.0, 0.0))
+    print(f"[calibration] EAR baseline {baseline if baseline else float('nan'):.3f} -> blink < {blink_ear:.3f}, "
+          f"open > {open_ear:.3f}; straight head yaw={yaw0:+.3f} pitch={pitch0:+.3f}")
+    gate = BlinkGate(blink_ear, open_ear)
+    learned_sign: dict[str, float] = {}   # direction name -> sign of the head-pose proxy change
+
     all_features: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
-    for idx, (tx, ty) in enumerate(CALIBRATION_TARGETS):
-        px, py = int(tx * frame_w), int(ty * frame_h)
-        samples: list[np.ndarray] = []
-        started = time.monotonic()
-        while True:
-            frame, _, feats, _ = tracker.read()
-            canvas = webcam_canvas(frame)
-            elapsed = time.monotonic() - started
-            settling = elapsed < settle_seconds
-            progress = min(elapsed / (hold_seconds + settle_seconds), 1.0)
-            _draw_target(canvas, (px, py), idx + 1, progress, settling)
-            _draw_status(canvas, f"Look directly at target {idx + 1} of {len(CALIBRATION_TARGETS)}")
-            if feats is not None and not settling:
-                samples.append(feats)
-            show(canvas)
-            if elapsed >= hold_seconds + settle_seconds:
-                break
 
-        if len(samples) >= min_samples_per_point:
-            all_features.append(np.median(samples, axis=0))
-            all_targets.append(np.array([px, py], dtype=np.float64))
-        else:
-            print(f"[calibration] target {idx + 1} skipped: face not tracked reliably")
+    for stage_idx, (name, instruction, required, extra) in enumerate(stages):
+        stage_label = f"Head {stage_idx + 1}/{len(stages)}: {name}"
+        grid = grid_targets(TURNED_GRID_N if required else STRAIGHT_GRID_N)
+        # Center first, then the stage's extra interior point(s) (a short hop
+        # from the center), then the grid ring(s).
+        targets = [grid[0], *[p for p in extra if p not in grid], *grid[1:]]
+
+        # Phase 2: get the head into this stage's pose and hold it.
+        if required:
+            held_since: Optional[float] = None
+            wait_started = time.monotonic()
+            skipped = False
+            deltas = {"yaw": 0.0, "pitch": 0.0}
+            reached = False
+            while True:
+                frame, landmarks, _, _ = tracker.read()
+                now = time.monotonic()
+                canvas = face_canvas(frame)
+                fraction, wrong_way = 0.0, False
+                if landmarks is not None:
+                    yaw, pitch = head_pose_proxies(landmarks)
+                    deltas = {"yaw": yaw - yaw0, "pitch": pitch - pitch0}
+                    fraction, wrong_way = head_stage_progress(required, deltas, learned_sign)
+                turned = landmarks is not None and fraction >= 1.0
+                if turned:
+                    held_since = held_since or now
+                else:
+                    held_since = None
+                holding_for = now - held_since if held_since else 0.0
+                bar_w = int(min(1.0, fraction) * 300)
+                bar_color = (0, 200, 0) if turned else ((0, 0, 255) if wrong_way else (0, 165, 255))
+                cv2.rectangle(canvas, (16, 60), (316, 84), (60, 60, 60), -1)
+                cv2.rectangle(canvas, (16, 60), (16 + bar_w, 84), bar_color, -1)
+                cv2.putText(canvas, stage_label, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                hint = "  (hold...)" if turned else ("  (other way!)" if wrong_way else "")
+                _draw_status(canvas, instruction + hint + "   |   S = skip this pose", 24)
+                key = show(canvas)
+                if key == ord("s"):
+                    skipped = True
+                    break
+                if turned and holding_for >= HEAD_HOLD_S:
+                    reached = True
+                    break
+                if now - wait_started > HEAD_MAX_WAIT_S and landmarks is not None:
+                    print(f"[calibration] {name}: head not turned enough after {HEAD_MAX_WAIT_S:.0f}s, using the current pose")
+                    break
+            if skipped:
+                print(f"[calibration] stage '{name}' skipped")
+                continue
+            if reached:
+                for axis, (direction, _) in required.items():
+                    if expected_sign(learned_sign, direction) is None and deltas[axis] != 0:
+                        learned_sign[direction] = math.copysign(1.0, deltas[axis])
+
+        # Phase 3: pre-roll on the center dot.
+        cx, cy = int(targets[0][0] * frame_w), int(targets[0][1] * frame_h)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < CAL_PREROLL_S:
+            frame, landmarks, _, _ = tracker.read()
+            canvas = eyes_canvas(frame, landmarks)
+            _draw_target(canvas, (cx, cy), 0.0, settling=True)
+            _draw_status(canvas, f"{stage_label} - keep your head there, follow the dot with your eyes only")
+            show(canvas)
+
+        # Phase 4: the targets.
+        stage_ok = 0
+        for idx, (tx, ty) in enumerate(targets):
+            px, py = int(tx * frame_w), int(ty * frame_h)
+            samples: list[np.ndarray] = []
+            started = time.monotonic()
+            capture_started: Optional[float] = None
+            while True:
+                frame, landmarks, feats, ear = tracker.read()
+                now = time.monotonic()
+                settling = now - started < CAL_SETTLE_S
+                fully_open, blinking = gate.update(ear, now)
+                if not settling:
+                    capture_started = capture_started or now
+                    if feats is not None and fully_open:
+                        samples.append(feats)
+                canvas = eyes_canvas(frame, landmarks)
+                _draw_target(canvas, (px, py), min(1.0, len(samples) / CAL_TARGET_SAMPLES), settling)
+                if blinking:
+                    cv2.circle(canvas, (px, py), 34, (0, 120, 255), 2, cv2.LINE_AA)
+                _draw_status(canvas, f"{stage_label}   target {idx + 1}/{len(targets)}")
+                show(canvas)
+                if len(samples) >= CAL_TARGET_SAMPLES:
+                    break
+                if capture_started is not None and now - capture_started > CAL_MAX_CAPTURE_S:
+                    break
+            if len(samples) >= CAL_MIN_SAMPLES:
+                all_features.append(np.median(samples, axis=0))
+                all_targets.append(np.array([px, py], dtype=np.float64))
+                stage_ok += 1
+            else:
+                print(f"[calibration] {name} target {idx + 1} skipped: only {len(samples)} clean samples")
+        print(f"[calibration] stage '{name}': {stage_ok}/{len(targets)} targets")
 
     finish_window()
-
     if len(all_features) < 6:
-        raise RuntimeError("Too few good calibration points captured; try again with better lighting.")
+        raise RuntimeError("Too few good calibration points; try again with better lighting, eyes open.")
 
-    mapping = fit_calibration(all_features, all_targets)
-    calib = GazeCalibration(mapping=mapping, frame_w=frame_w, frame_h=frame_h)
+    mapping, mean, std = fit_calibration(all_features, all_targets)
+    calib = GazeCalibration(mapping=mapping, feat_mean=mean, feat_std=std, frame_w=frame_w, frame_h=frame_h,
+                            blink_ear=blink_ear, open_ear=open_ear)
     calib.save()
-    err = calibration_error(all_features, all_targets, mapping)
-    print(f"[calibration] done on {len(all_features)}/{len(CALIBRATION_TARGETS)} points, "
+    pred = ((np.vstack(all_features) - mean) / std) @ mapping
+    err = float(np.mean(np.linalg.norm(pred - np.vstack(all_targets), axis=1)))
+    print(f"[calibration] done: {len(all_features)} targets over {len(stages)} head pose(s), "
           f"mean fit error {err:.1f}px, saved to {CALIBRATION_PATH}")
     return calib
