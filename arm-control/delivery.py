@@ -49,7 +49,6 @@ from head_control import HeadRange, HeadSteer, SteerCommand, draw_steer_panel, s
 NUDGE_MM = 50.0
 PLACE_CLEARANCE_MM = 5.0        # set the object down this far above where it was resting
 APPROACH_ABOVE_PLACE_MM = 100.0
-LET_GO_LIFT_MM = 40.0
 MAX_TCP_Z_MM = 500.0
 MIN_RADIUS_MM = 200.0           # don't pull the object into the arm's base
 PLACE_OBSTACLE_MARGIN_MM = 25.0
@@ -82,6 +81,10 @@ class Held:
 class Status:
     def __init__(self):
         self.status = ""
+        self.motion_started = False
+        self.plan_rejection: Optional[str] = None
+        self.motion_failure: Optional[str] = None
+        self.holding: Optional[bool] = None
 
 
 @dataclass
@@ -275,6 +278,7 @@ class DeliveryIO:
     intrinsics: object        # main.Intrinsics or None
     frame_w: int
     frame_h: int
+    return_after_release: Optional[Callable] = None  # async (held, status) -> bool
 
 
 async def table_point_from_pixel(io: DeliveryIO, u: float, v: float) -> Optional[np.ndarray]:
@@ -309,6 +313,8 @@ class DeliverySession:
         self.status = Status()
         self.message = f"Holding: {held.label}"
         self.error: Optional[Exception] = None
+        self.released = False         # opening succeeded; this session can never carry again
+        self.requires_operator = False
         self.finished = False         # object released: main goes back to live selection
         self.task: Optional[asyncio.Task] = None
         w, h = io.frame_w, io.frame_h
@@ -342,6 +348,9 @@ class DeliverySession:
         return self.screen == "place_look"
 
     def _run(self, coro) -> None:
+        if self.released or self.requires_operator:
+            coro.close()
+            return
         self.error = None
         self.selector.reset()
         self.stop_selector.reset()
@@ -354,6 +363,7 @@ class DeliverySession:
             raise
         except Exception as e:
             self.error = e
+            self.requires_operator = True
             self.message = f"Error: {e}"
             print(f"[deliver] {self.message}")
 
@@ -362,7 +372,8 @@ class DeliverySession:
         if ok:
             self.held.pose = target
         else:
-            self.message = f"Couldn't plan the move to {label}; try something else"
+            self.requires_operator = True
+            self.message = f"Move to {label} failed; paused for the operator"
         return ok
 
     async def stop(self, reason: str = "Stopped") -> None:
@@ -375,11 +386,15 @@ class DeliverySession:
             if actual is not None:
                 self.held.pose = pose_at(xyz(actual), self.held.orientation)
         self.message = reason
+        if self.released and not self.finished:
+            self.requires_operator = True
         print(f"[deliver] {reason}")
 
     # ---- actions
 
     def _start(self, action: str) -> None:
+        if self.released or self.requires_operator:
+            return
         if action == "let_go":
             self.screen = "confirm"
             self.selector.reset()
@@ -408,16 +423,16 @@ class DeliverySession:
             self.message = "Here you go"
 
     async def _release_at(self, above: Pose, place: Pose, where: str) -> None:
-        """Above -> straight down -> open -> straight up -> home. Opens only if
-        the descent succeeded, so a failed plan never drops the object."""
+        """Above -> straight down -> open -> verified return sequence."""
+        if self.released or self.requires_operator:
+            return
         if np.linalg.norm(xyz(above) - xyz(self.held.pose)) >= MIN_MOVE_MM:
             if not await self._move(above, f"above {where}", self.io.upright()):
                 return
         if not await self._move(place, f"down to {where}", self.io.straight_line()):
-            await self._move(above, "back up", self.io.straight_line())
             return
         await self.io.open_gripper(self.status)
-        await self._move(above, "lift (straight up)", self.io.straight_line())
+        self.released = True
         await self._go_home_and_finish(f"Placed the {self.held.label}")
 
     async def _put_back(self) -> None:
@@ -474,17 +489,21 @@ class DeliverySession:
         await self._release_at(above, place, "that spot")
 
     async def _let_go(self) -> None:
+        if self.released or self.requires_operator:
+            return
         await self.io.open_gripper(self.status)
-        up = clamp_to_workspace(xyz(self.held.pose) + np.array([0.0, 0.0, LET_GO_LIFT_MM]),
-                                self.held, self.axes, self.io.reach_mm - 30.0)
-        await self._move(pose_at(up, self.held.orientation), "lift away", self.io.straight_line())
+        self.released = True
         await self._go_home_and_finish("Let go")
 
     async def _go_home_and_finish(self, msg: str) -> None:
-        home = self.held.home
-        if home is not None:
-            await self.io.move(pose_at(xyz(home), self.held.orientation), "the observe pose",
-                               self.status, None, self.io.upright())
+        if self.io.return_after_release is None:
+            self.requires_operator = True
+            self.message = f"{msg}; return is not configured. Paused for the operator"
+            return
+        if not await self.io.return_after_release(self.held, self.status):
+            self.requires_operator = True
+            self.message = f"{msg}; return failed. Paused for the operator"
+            return
         self.message = msg
         self.finished = True
 
@@ -493,10 +512,16 @@ class DeliverySession:
     async def tick(self, gaze_pt, blinking: bool, head, obs, now: Optional[float] = None):
         now = time.monotonic() if now is None else now
         w, h = self.io.frame_w, self.io.frame_h
-        if self.screen == "steer":
-            return await self._tick_steer(gaze_pt, blinking, head, now)
         if self.busy:
             return await self._tick_busy(gaze_pt, blinking, now)
+        if self.released or self.requires_operator:
+            canvas = np.zeros((h, w, 3), np.uint8)
+            state = "Object released" if self.released else "Delivery paused"
+            put_lines(canvas, [state, self.message[:85],
+                               "Operator check required before another action."], 30, 60)
+            return canvas
+        if self.screen == "steer":
+            return await self._tick_steer(gaze_pt, blinking, head, now)
         if self.screen == "place_look":
             return self._tick_place_look(gaze_pt, blinking, obs, now)
 

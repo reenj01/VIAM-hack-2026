@@ -101,17 +101,21 @@ class GripperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             GRPCError(Status.CANCELLED, "request cancelled"),
         ):
             with self.subTest(error=type(failure).__name__, message=str(failure)):
-                gripper = SimpleNamespace(do_command=AsyncMock(side_effect=failure), grab=AsyncMock())
+                gripper = SimpleNamespace(
+                    do_command=AsyncMock(side_effect=[{"pos": 840.0}, failure]), grab=AsyncMock()
+                )
                 arm = SimpleNamespace(do_command=AsyncMock())
                 job = app.GraspJob()
 
-                with patch.object(app, "DRY_RUN", False):
+                with patch.object(app, "DRY_RUN", False), patch.object(app, "GRIPPER_CLOSE_FULLY", False):
                     with self.assertRaises(type(failure)) as caught:
                         await app.close_gripper(gripper, arm, 40.0, job)
 
                 self.assertIs(caught.exception, failure)
                 self.assertTrue(job.motion_started)
-                gripper.do_command.assert_awaited_once()
+                self.assertEqual(gripper.do_command.await_count, 2)
+                self.assertEqual(gripper.do_command.await_args_list[0].args, ({"get": True},))
+                self.assertEqual(gripper.do_command.await_args_list[1].args, ({"set": 390},))
                 arm.do_command.assert_not_awaited()
                 gripper.grab.assert_not_awaited()
 
@@ -149,6 +153,10 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(app, "EXECUTE", True), patch.object(app, "DRY_RUN", False),
             patch.object(app, "SET_HOME", False), patch.object(app, "SET_SERVE", False),
             patch.object(app, "GO_HOME_ON_START", True), patch.object(app, "MENU", False),
+            patch.object(app, "FINGER_CLEARANCE_MM", 60.0),
+            patch.object(app, "MAX_FINGER_EXTENSION_MM", 60.0),
+            patch.object(app, "GRIPPER_BODY_FROM_FLANGE_MM", 105.0),
+            patch.object(app, "require_arm_joint_ranges", new=AsyncMock()),
             patch.object(app, "USER_PROFILE", "eyes"),
             patch.object(app, "resolve_motion_name", return_value="motion"),
             patch.object(app.Camera, "from_robot", return_value=camera),
@@ -190,25 +198,28 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         state.feed.stop.assert_awaited_once()
         state.gaze.close.assert_called_once()
 
-    async def test_disconnect_after_motion_started_requires_operator_restart(self):
+    async def test_disconnect_after_motion_started_pauses_without_replay_or_crash(self):
+        failed = False
+
         async def fail_grasp(*args, **kwargs):
+            nonlocal failed
             job = args[9]
             job.motion_started = True
             job.connection_error = ConnectionError("response lost after command")
+            failed = True
 
         with ExitStack() as stack:
             state = self.mocked_session(stack)
             selected = SimpleNamespace(box=SimpleNamespace(label="cup", x0=1, y0=2, x1=3, y1=4))
             state.lock.update.return_value = (None, 1.0, selected)
-            stack.enter_context(patch.object(app, "run_grasp", new=AsyncMock(side_effect=fail_grasp)))
+            grasp = stack.enter_context(patch.object(app, "run_grasp", new=AsyncMock(side_effect=fail_grasp)))
             stop = stack.enter_context(patch.object(app, "stop_everything", new=AsyncMock()))
+            stack.enter_context(patch.object(app.cv2, "waitKey", side_effect=lambda *_: ord("q") if failed else 0))
 
-            with self.assertRaisesRegex(RuntimeError, "will not be replayed") as caught:
-                await asyncio.wait_for(app.run_session(sentinel.machine), timeout=2)
+            await asyncio.wait_for(app.run_session(sentinel.machine), timeout=2)
 
-        self.assertFalse(app.is_transport_error(caught.exception))
-        self.assertIsInstance(caught.exception.__cause__, app.ReconnectRequired)
-        stop.assert_awaited()
+        grasp.assert_awaited_once()
+        stop.assert_awaited_once()
         state.feed.stop.assert_awaited_once()
         state.gaze.close.assert_called_once()
 
