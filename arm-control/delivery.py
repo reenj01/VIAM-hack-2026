@@ -308,6 +308,7 @@ class DeliverySession:
         self.screen = "menu"          # menu | confirm | place_look | steer
         self.status = Status()
         self.message = f"Holding: {held.label}"
+        self.error: Optional[Exception] = None
         self.finished = False         # object released: main goes back to live selection
         self.task: Optional[asyncio.Task] = None
         w, h = io.frame_w, io.frame_h
@@ -341,6 +342,7 @@ class DeliverySession:
         return self.screen == "place_look"
 
     def _run(self, coro) -> None:
+        self.error = None
         self.selector.reset()
         self.stop_selector.reset()
         self.task = asyncio.create_task(self._guard(coro))
@@ -351,6 +353,7 @@ class DeliverySession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            self.error = e
             self.message = f"Error: {e}"
             print(f"[deliver] {self.message}")
 

@@ -45,6 +45,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from grpclib import GRPCError, Status
+from grpclib.exceptions import StreamTerminatedError
 
 from viam.robot.client import RobotClient
 from viam.components.arm import Arm
@@ -105,6 +107,8 @@ MOTION_SERVICE_NAME = "motion"       # falls back to the SDK default name "built
 GRIPPER_NAME = "gripper"
 ARM_NAME = "arm"
 SEGMENTER_TIMEOUT_S = 60.0           # 3D segmentation took ~4 s on this machine
+CAPTURE_TIMEOUT_S = 30.0
+RECONNECT_DELAY_S = 2.0
 
 MOTION_REFERENCE_FRAME = "world"
 
@@ -174,6 +178,7 @@ if USER_PROFILE not in ("eyes", "head"):
 MENU = "--menu" in sys.argv or USER_PROFILE == "head"
 SERVE_POSE_PATH = HERE / "serve_pose.json"
 LIVE_COOLDOWN_S = 2.5          # after putting something down, don't immediately select again
+MAX_OBSERVATION_AGE_S = 3.0    # never select from an old camera/detection snapshot
 # A segmented object whose center is this close to the gripper is the one in
 # the gripper (the wrist camera can see it): never a target, never an obstacle.
 IN_GRIPPER_RADIUS_MM = 120.0
@@ -181,14 +186,35 @@ IN_GRIPPER_RADIUS_MM = 120.0
 
 async def connect():
     env = load_env()
-    # The SDK's periodic health check has a 1 s deadline; a slow call on the
-    # machine (3D segmentation) trips it and the client tears the connection
-    # down. Disable the check; failures surface on the call itself instead.
+    # SDK 0.80.0 hard-codes a 1 s ResourceNames health-check deadline. Slow
+    # camera/vision calls can make that check tear down a working connection.
+    # Both intervals must be zero: the SDK uses reconnect_interval as the
+    # probe interval when check_connection_interval is zero. The application
+    # rebuilds the client and all resource handles after a transport failure.
     opts = RobotClient.Options.with_api_key(
         api_key=env["VIAM_API_KEY"], api_key_id=env["VIAM_API_KEY_ID"],
         check_connection_interval=0, attempt_reconnect_interval=0,
     )
     return await RobotClient.at_address(env["VIAM_MACHINE_ADDRESS"], opts)
+
+
+class ReconnectRequired(ConnectionError):
+    """A failed transport requires a new client and new resource handles."""
+
+
+def is_transport_error(error: Exception) -> bool:
+    if isinstance(error, (ConnectionError, StreamTerminatedError)):
+        return True
+    if isinstance(error, GRPCError):
+        if error.status == Status.UNAVAILABLE:
+            return True
+        # The Rust WebRTC bridge sometimes reports a closed channel as UNKNOWN.
+        if error.status == Status.UNKNOWN:
+            message = (error.message or "").lower()
+            return not message or any(s in message for s in (
+                "channel closed", "connection lost", "datachannel", "stream closed"))
+    # A slow request alone is not evidence that the transport has closed.
+    return False
 
 
 def decode_color_frame(images):
@@ -246,6 +272,7 @@ class RobotFeed:
         self.paused = False
         self.fps = 0.0
         self.capture_ms = 0.0
+        self.connection_error: Optional[Exception] = None
         self._task: Optional[asyncio.Task] = None
 
     def _boxes(self, detections) -> list[Box]:
@@ -253,7 +280,8 @@ class RobotFeed:
             [box_from_detection(d, i, self.frame_w, self.frame_h) for i, d in enumerate(detections)])
 
     async def _capture_paired(self) -> Observation:
-        res = await self.detector.capture_all_from_camera(CAMERA_NAME, return_image=True, return_detections=True)
+        res = await self.detector.capture_all_from_camera(
+            CAMERA_NAME, return_image=True, return_detections=True, timeout=CAPTURE_TIMEOUT_S)
         frame = decode_viam_image(res.image)
         if frame is None:
             raise RuntimeError("combined capture returned no decodable image")
@@ -263,27 +291,41 @@ class RobotFeed:
 
     async def _capture_unpaired(self) -> Observation:
         try:
-            images, _ = await self.cam.get_images(filter_source_names=[COLOR_SOURCE_NAME])
-        except Exception:
+            images, _ = await self.cam.get_images(filter_source_names=[COLOR_SOURCE_NAME], timeout=CAPTURE_TIMEOUT_S)
+        except Exception as error:
+            if is_transport_error(error):
+                raise
             images = []
         if not images:
-            images, _ = await self.cam.get_images()
+            images, _ = await self.cam.get_images(timeout=CAPTURE_TIMEOUT_S)
         frame = decode_color_frame(images)
         if frame is None:
             raise RuntimeError(f"no color frame from camera '{CAMERA_NAME}'")
         if not self.frame_w:
             self.frame_h, self.frame_w = frame.shape[:2]
-        detections = await self.detector.get_detections_from_camera(CAMERA_NAME)
+        detections = await self.detector.get_detections_from_camera(CAMERA_NAME, timeout=CAPTURE_TIMEOUT_S)
         return Observation(frame, self._boxes(detections), time.monotonic(), False)
 
     async def capture(self) -> Observation:
         if self.paired:
             try:
                 return await self._capture_paired()
-            except Exception as e:
+            except Exception as paired_error:
+                if is_transport_error(paired_error):
+                    raise
+                # A closed connection makes both capture methods fail. Do not
+                # mistake that for an unsupported combined capture forever.
+                try:
+                    obs = await self._capture_unpaired()
+                except Exception as fallback_error:
+                    if is_transport_error(fallback_error):
+                        raise
+                    raise paired_error
                 self.paired = False
-                print(f"[feed] '{DETECTOR_NAME}' can't do a combined capture ({type(e).__name__}: {e}); "
-                      "falling back to separate image + detection calls, which can come from different frames")
+                print(f"[feed] '{DETECTOR_NAME}' can't do a combined capture "
+                      f"({type(paired_error).__name__}: {paired_error}); falling back to separate "
+                      "image + detection calls, which can come from different frames")
+                return obs
         return await self._capture_unpaired()
 
     async def first(self) -> tuple[int, int]:
@@ -311,7 +353,11 @@ class RobotFeed:
                 self.fps = 0.7 * self.fps + 0.3 / max(1e-3, dt)
                 self.obs = obs
             except Exception as e:
+                self.obs = None  # Never let gaze lock a box from the last good frame.
                 print(f"[feed] capture error: {e}")
+                if is_transport_error(e):
+                    self.connection_error = e
+                    return
                 await asyncio.sleep(0.5)
 
 
@@ -360,11 +406,13 @@ class Intrinsics:
 
 async def get_intrinsics(cam: Camera) -> Optional[Intrinsics]:
     try:
-        ip = (await cam.get_properties()).intrinsic_parameters
+        ip = (await cam.get_properties(timeout=CAPTURE_TIMEOUT_S)).intrinsic_parameters
         if ip.focal_x_px > 0 and ip.width_px > 0:
             return Intrinsics(ip.focal_x_px, ip.focal_y_px, ip.center_x_px, ip.center_y_px,
                               ip.width_px, ip.height_px)
     except Exception as e:
+        if is_transport_error(e):
+            raise
         print(f"[main] camera intrinsics unavailable ({type(e).__name__}: {e})")
     return None
 
@@ -510,6 +558,8 @@ class GraspJob:
         self.holding: Optional[bool] = None
         self.held: Optional[Held] = None      # what the gripper holds right now (kept current during a swap)
         self.ok = False                       # the whole job succeeded
+        self.motion_started = False
+        self.connection_error: Optional[Exception] = None
 
     @property
     def done(self) -> bool:
@@ -542,6 +592,7 @@ async def move_to(motion: MotionClient, pose: Pose, label: str, job: GraspJob,
         await asyncio.sleep(0.4)
         return True
     # viam-sdk 0.80.0: component_name is the component's plain name (proto string).
+    job.motion_started = True
     ok = await motion.move(
         component_name=GRIPPER_NAME,
         destination=PoseInFrame(reference_frame=MOTION_REFERENCE_FRAME, pose=pose),
@@ -565,6 +616,7 @@ async def open_gripper(gripper: Gripper, job: GraspJob) -> None:
     job.status = "DRY RUN, would open the gripper" if DRY_RUN else "opening the gripper"
     print(f"[grab] {job.status}")
     if not DRY_RUN:
+        job.motion_started = True
         await gripper.open()
         await asyncio.sleep(0.3)   # let the fingers finish opening
 
@@ -580,6 +632,7 @@ async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJ
                       else "DRY RUN, would call grab()")
         print(f"[grab] {job.status}")
         return
+    job.motion_started = True
     if width_mm > max_span_mm:
         job.status = f"estimated width {width_mm:.0f} mm exceeds the gripper's ~{max_span_mm:.0f} mm span; using grab()"
         print(f"[grab] {job.status}")
@@ -599,6 +652,11 @@ async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJ
                 await asyncio.sleep(0.3)
                 return
             except Exception as e:
+                if (is_transport_error(e) or isinstance(e, TimeoutError)
+                        or (isinstance(e, GRPCError) and e.status in (Status.DEADLINE_EXCEEDED, Status.CANCELLED))):
+                    # The command may have reached the gripper before its
+                    # response was lost; do not issue a different close command.
+                    raise
                 print(f"[grab] {cmd} on {label} not accepted ({type(e).__name__}: {e})")
         print("[grab] width-based close unavailable; using grab()")
     else:
@@ -682,6 +740,8 @@ async def run_put_back(motion: MotionClient, gripper: Gripper, held: Held, job: 
         job.status = "cancelled"
         raise
     except Exception as e:
+        if is_transport_error(e):
+            job.connection_error = e
         job.status = f"error: {e}"
         print(f"[grab] {job.status}")
         return False
@@ -696,14 +756,18 @@ async def capture_objects(segmenter: VisionClient):
                                                       timeout=SEGMENTER_TIMEOUT_S)
         return list(res.objects or [])
     except Exception as e:
+        if is_transport_error(e):
+            raise
         print(f"[grab] combined segmenter capture unavailable ({type(e).__name__}); using get_object_point_clouds")
         return list(await segmenter.get_object_point_clouds(CAMERA_NAME, timeout=SEGMENTER_TIMEOUT_S))
 
 
 async def gripper_world_pose(motion: MotionClient) -> Optional[Pose]:
     try:
-        return (await motion.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME)).pose
+        return (await motion.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME, timeout=CAPTURE_TIMEOUT_S)).pose
     except Exception as e:
+        if is_transport_error(e):
+            raise
         print(f"[grab] couldn't read the gripper pose ({type(e).__name__}: {e})")
         return None
 
@@ -718,6 +782,8 @@ async def measure_tcp_mm(motion: MotionClient) -> float:
             return d
         print(f"[main] measured gripper TCP offset {d:.0f} mm looks wrong; using {GRIPPER_TCP_FROM_FLANGE_MM:.0f}")
     except Exception as e:
+        if is_transport_error(e):
+            raise
         print(f"[main] couldn't measure the gripper TCP offset ({type(e).__name__}: {e}); "
               f"using {GRIPPER_TCP_FROM_FLANGE_MM:.0f} mm")
     return GRIPPER_TCP_FROM_FLANGE_MM
@@ -799,6 +865,8 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         job.status = "cancelled"
         raise
     except Exception as e:
+        if is_transport_error(e):
+            job.connection_error = e
         job.status = f"error: {e}"
         print(f"[grab] {job.status}")
         return False
@@ -896,19 +964,20 @@ def resolve_motion_name(machine) -> str:
                      f"Resources found: {sorted(have)}")
 
 
-def load_or_calibrate(gaze: WebcamGazeTracker, frame_w: int, frame_h: int) -> GazeCalibration:
+def load_or_calibrate(gaze: WebcamGazeTracker, frame_w: int, frame_h: int,
+                      recovering: bool = False) -> GazeCalibration:
     """Calibrate every run; --skip-calibration reuses the last one; C recalibrates mid-run."""
-    if SKIP_CALIBRATION:
+    if SKIP_CALIBRATION or recovering:
         calib = GazeCalibration.load()
         if calib is not None and (calib.frame_w, calib.frame_h) == (frame_w, frame_h):
-            print(f"[main] --skip-calibration: reusing {CALIBRATION_PATH}")
+            print(f"[main] reusing {CALIBRATION_PATH}")
             return calib
         print("[main] no compatible saved calibration (missing, older format, or other frame size); recalibrating")
     return run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True, quick=QUICK_CALIBRATION)
 
 
-async def main():
-    machine = await connect()
+async def run_session(machine: RobotClient, recovering: bool = False):
+    """All resource handles belong to this connection; none survive a reconnect."""
     motion_name = resolve_motion_name(machine)
     print(f"[main] motion service '{motion_name}'. " + (
         "EXECUTE: the arm WILL move. Keep a hand on the E-stop." if EXECUTE
@@ -925,21 +994,24 @@ async def main():
         save_home_pose(pose)
         print(f"[main] home pose saved to {HOME_POSE_PATH}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} "
               f"o=({pose.o_x:.2f}, {pose.o_y:.2f}, {pose.o_z:.2f}) theta={pose.theta:.0f}")
-        await machine.close()
         return
 
     if SET_SERVE:
         pose = (await motion.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME)).pose
         problem = serve_problem(pose)
         if problem:
-            await machine.close()
             raise SystemExit(f"Not saving that serve pose: {problem}. Move the gripper to where the user "
                              "should receive objects, over the table, and run --set-serve again.")
         SERVE_POSE_PATH.write_text(json.dumps({k: getattr(pose, k) for k in POSE_FIELDS}, indent=2))
         print(f"[main] serve pose saved to {SERVE_POSE_PATH}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f}. "
               "'Bring to me', Closer/Away and head steering use it; nothing goes past it toward the user.")
-        await machine.close()
         return
+
+    if recovering and EXECUTE:
+        status = await gripper.is_holding_something(timeout=CAPTURE_TIMEOUT_S)
+        if bool(getattr(status, "is_holding_something", status)):
+            raise RuntimeError("Reconnected, but the gripper reports holding an object. "
+                               "Check the arm before restarting; no action was replayed.")
 
     serve = load_serve_pose()
     if serve is None:
@@ -958,8 +1030,13 @@ async def main():
     home = load_home_pose()
     if home is None:
         print("[main] no home_pose.json; objects are carried back to where the gripper was when locked")
-    elif GO_HOME_ON_START and EXECUTE:
-        await move_to(motion, home, "home", GraspJob(), constraints=upright())
+    elif GO_HOME_ON_START and EXECUTE and not recovering:
+        try:
+            await move_to(motion, home, "home", GraspJob(), constraints=upright())
+        except Exception as error:
+            # A lost response cannot tell us whether a motion command ran.
+            raise RuntimeError("Startup movement failed. Check the arm before restarting; "
+                               "the movement will not be retried automatically.") from error
 
     gaze = WebcamGazeTracker(camera_index=WEBCAM_INDEX)
     lock = GazeLockController()
@@ -969,16 +1046,17 @@ async def main():
     held: Optional[Held] = None     # demo mode: what the gripper has between picks
     live_blocked_until = 0.0
     hovered, progress = None, 0.0
+    keep_window = False
 
     try:
         frame_w, frame_h = await feed.first()
         # Calibrate in the same AUTOSIZE window the live loop uses. Background
         # capture starts afterwards: calibration blocks the event loop.
         cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
-        calib = load_or_calibrate(gaze, frame_w, frame_h)
+        calib = load_or_calibrate(gaze, frame_w, frame_h, recovering=recovering)
         head_range: Optional[HeadRange] = None
         if USER_PROFILE == "head":
-            head_range = HeadRange.load() if SKIP_CALIBRATION else None
+            head_range = HeadRange.load() if SKIP_CALIBRATION or recovering else None
             if head_range is None:
                 head_range = calibrate_head_range(gaze, frame_w, frame_h, WINDOW)
             else:
@@ -989,8 +1067,16 @@ async def main():
               f"user profile '{USER_PROFILE}'"
               + (f", serving at ({serve.x:.0f}, {serve.y:.0f}, {serve.z:.0f})" if serve else ""))
         feed.start()
+        if recovering:
+            live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
 
         while True:
+            if session is not None and session.error is not None and is_transport_error(session.error):
+                raise ReconnectRequired("Connection lost during delivery") from session.error
+            if job is not None and job.connection_error is not None:
+                raise ReconnectRequired("Connection lost during grasp processing") from job.connection_error
+            if feed.connection_error is not None:
+                raise ReconnectRequired("Connection lost during capture") from feed.connection_error
             if session is not None:
                 # HOLDING: the arm has the object; the menu (or steering) decides what happens.
                 feed.paused = not session.wants_feed
@@ -1015,7 +1101,8 @@ async def main():
             if job is not None and not lock.is_locked:
                 # P (operator): putting the held object back; no gaze lock involved.
                 feed.paused = True
-                view = (feed.obs.frame * 0.5).astype(np.uint8)
+                view = ((feed.obs.frame * 0.5).astype(np.uint8) if feed.obs is not None
+                        else np.zeros((frame_h, frame_w, 3), dtype=np.uint8))
                 for i, line in enumerate([job.status, "Q stop+quit"]):
                     put_text(view, line, (16, 40 + 36 * i), 0.8)
                 cv2.imshow(WINDOW, view)
@@ -1062,6 +1149,19 @@ async def main():
             feed.paused = False
 
             obs = feed.obs
+            if obs is None or time.monotonic() - obs.at > MAX_OBSERVATION_AGE_S:
+                lock.release()
+                estimator.reset()
+                canvas = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+                cv2.putText(canvas, "Waiting for a fresh robot frame", (24, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 160, 255), 2, cv2.LINE_AA)
+                cv2.putText(canvas, "No object can be selected until a fresh frame arrives", (24, 95),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+                cv2.imshow(WINDOW, canvas)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                await asyncio.sleep(0.05)
+                continue
             frame, boxes = obs.frame, obs.boxes
             gaze_pt, ear, blinking = await asyncio.to_thread(estimator.read)
             locked = None
@@ -1115,17 +1215,62 @@ async def main():
                 calib = run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True,
                                         quick=QUICK_CALIBRATION)
                 estimator = GazeEstimator(gaze, calib)
+    except Exception as error:
+        if is_transport_error(error) and (
+                held is not None or session is not None
+                or (job is not None and (job.motion_started or job.held is not None))):
+            await stop_everything(arm, job)
+            raise RuntimeError("Connection lost during object handling. Check the arm before restarting; "
+                               "the interrupted action will not be replayed.") from error
+        # Calibration refers to the window's physical screen position. Keep
+        # that window in place while replacing only the connection and handles.
+        keep_window = is_transport_error(error)
+        if keep_window and feed.frame_w and feed.frame_h:
+            canvas = np.zeros((feed.frame_h, feed.frame_w, 3), dtype=np.uint8)
+            put_text(canvas, "Reconnecting to the robot; selection cleared", (24, 55), 0.8)
+            cv2.imshow(WINDOW, canvas)
+            cv2.waitKey(1)
+        raise
     finally:
         await feed.stop()
         if job is not None and job.task is not None and not job.task.done():
             await stop_everything(arm, job)
         if session is not None and session.busy:
-            await session.stop("Quit")
+            try:
+                await session.stop("Quit")
+            except Exception as error:
+                print(f"[main] delivery cleanup failed: {type(error).__name__}: {error}")
         if held is not None and not DRY_RUN:
             print(f"[main] note: the gripper is still holding the {held.label}")
         gaze.close()
-        cv2.destroyAllWindows()
-        await machine.close()
+        if not keep_window:
+            cv2.destroyAllWindows()
+
+
+async def main():
+    recovering = False
+    while True:
+        machine = None
+        try:
+            machine = await connect()
+            await run_session(machine, recovering=recovering)
+            return
+        except Exception as error:
+            if not is_transport_error(error):
+                cv2.destroyAllWindows()
+                raise
+            print(f"[connection] {type(error).__name__}: {error}. Reconnecting with fresh resource handles; "
+                  "the previous gaze selection is discarded.")
+            recovering = True
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            cv2.destroyAllWindows()
+            raise
+        finally:
+            # close() also cancels SDK background tasks: finish it BEFORE
+            # creating a replacement client, or it may cancel the new client.
+            if machine is not None:
+                await machine.close()
+        await asyncio.sleep(RECONNECT_DELAY_S)
 
 
 if __name__ == "__main__":
