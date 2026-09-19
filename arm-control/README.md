@@ -52,6 +52,23 @@ python main.py              # dry run: everything except motion, prints the pose
 python main.py --execute    # the arm moves
 ```
 
+Run `python preflight.py` first for read-only camera, detector, segmentation,
+gripper, and frame checks. Use the same Python environment as `main.py`.
+
+The display detector must correspond to the segmenter's detections. On the
+2026-09-19 live check, `vision-1`'s can box contained the projected 3D can
+center; `yolo-detector`'s cup box did not. For that setup, use
+`python preflight.py --detector vision-1`, then
+`python main.py --detector vision-1 --execute` to enable motion. The default
+remains `yolo-detector`; `--detector` explicitly selects the service to use.
+
+The SDK's one-second connection probe is disabled because slow vision requests
+can trigger it. If the transport closes while choosing an object, the app
+reconnects with fresh resource handles, clears the selection, and keeps the
+calibration window in place. It does not repeat the startup home movement.
+A connection loss during object handling ends the run and requires checking
+the arm before restarting; the interrupted action is not replayed.
+
 **Motion is opt-in.** Without `--execute`, the camera, YOLO, gaze, lock, 3D
 segmentation, transforms and safety checks all run and every pose is printed,
 but nothing is sent to the arm or gripper. `Q` cancels a grasp and sends
@@ -175,8 +192,9 @@ python main.py --user head        # head + eyes profile (dry run)
   startup. If grasps land high or low, tape-measure flange-to-fingertip and
   set `FINGERTIP_FROM_FLANGE_MM`.
 - The camera frame is a calibrated value, `(83, -14, 18)` mm, theta -97.7.
-  `preflight.py` checks it numerically: every segmented object should land on
-  the table in world coordinates.
+  `preflight.py` checks broad workspace height and reach limits. To verify
+  the mounting transform, compare reported world coordinates with measured
+  object locations; a passing range check alone does not validate calibration.
 - The table obstacle is a 200 mm box centered at z = -123, so the **table top
   is at world z = -23**; there are also wall and ceiling obstacles. The
   motion service plans around them; direct arm moves ignore them, so this
@@ -195,4 +213,5 @@ python main.py --user head        # head + eyes profile (dry run)
 - `FINGERTIP_FROM_FLANGE_MM` (grasp height).
 - The width-based gripper close (`{"set": pos}`, 0-850 scale); it falls back
   to `grab()` if rejected.
-- `preflight.py`'s world-transform check passes with objects on the table.
+- `preflight.py` passes, its projected pixels match the selected detector's
+  boxes, and its world coordinates agree with measured object locations.
