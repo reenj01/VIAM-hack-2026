@@ -13,14 +13,23 @@ YOLO, gaze, lock, 3D segmentation, transforms, checks) and the poses are
 printed, but no motion or gripper command is sent. Q cancels the grasp and
 sends arm.stop(), best effort; the physical E-STOP is the real stop.
 
-After the pick, the arm hovers holding the object and a big gaze menu decides
-what happens (delivery.py): bring it to the user, raise/lower/closer/away,
-put it back, place it down or where the user looks, let go, or (--user head)
-steer it with head motion (head_control.py).
+Demo mode (the default) has exactly two gaze actions:
+  1. Look at an object and hold: the arm picks it up and carries it back to
+     the observe pose, still holding it, so the camera sees the table again.
+  2. While holding, look at a DIFFERENT object and hold: the arm puts the held
+     one back down where it came from, then picks up the new one.
+The new object is located (and every object frozen into world coordinates)
+before anything moves; the put-back spot is then treated as an obstacle.
 
-Keys: Q stop+quit, R release the lock once the grasp attempt has finished, C recalibrate.
-Flags: --execute (allow motion), --user eyes|head, --skip-calibration (reuse the
-last calibration), --quick-calibration (straight-head stage only), --detector NAME,
+--menu instead shows a big gaze menu after the pick (delivery.py): bring it
+to the user, raise/lower/closer/away, put it back, place it down or where the
+user looks, let go, or (--user head, which implies --menu) steer it with head
+motion (head_control.py).
+
+Keys: Q stop+quit, R release the lock once the grasp attempt has finished, C recalibrate,
+P (demo mode, operator) put the held object back without picking another.
+Flags: --execute (allow motion), --menu, --user eyes|head, --skip-calibration (reuse
+the last calibration), --quick-calibration (straight-head stage only), --detector NAME,
 --set-home, --set-serve (record where objects are brought to the user).
 """
 
@@ -160,8 +169,14 @@ SET_SERVE = "--set-serve" in sys.argv     # record where objects are brought to 
 USER_PROFILE = sys.argv[sys.argv.index("--user") + 1] if "--user" in sys.argv else "eyes"
 if USER_PROFILE not in ("eyes", "head"):
     raise SystemExit("--user must be 'eyes' or 'head'")
+# Default: the two-action demo (pick; look at another object to swap). --menu:
+# the post-pick gaze menu. Head steering lives in the menu, so --user head implies it.
+MENU = "--menu" in sys.argv or USER_PROFILE == "head"
 SERVE_POSE_PATH = HERE / "serve_pose.json"
 LIVE_COOLDOWN_S = 2.5          # after putting something down, don't immediately select again
+# A segmented object whose center is this close to the gripper is the one in
+# the gripper (the wrist camera can see it): never a target, never an obstacle.
+IN_GRIPPER_RADIUS_MM = 120.0
 
 
 async def connect():
@@ -418,6 +433,25 @@ async def obstacles_in_world(robot: RobotClient, objs, exclude) -> Optional[Worl
     return WorldState(obstacles=[GeometriesInFrame(reference_frame=MOTION_REFERENCE_FRAME, geometries=geoms)])
 
 
+def merge_world_states(*states: Optional[WorldState]) -> Optional[WorldState]:
+    obstacles = [gif for s in states if s is not None for gif in s.obstacles]
+    return WorldState(obstacles=obstacles) if obstacles else None
+
+
+async def objects_in_gripper(robot: RobotClient, objs, gripper_pose: Optional[Pose]) -> list:
+    """Segmented objects sitting at the gripper: what it's holding, seen by the wrist camera."""
+    if gripper_pose is None:
+        return []
+    found = []
+    for o in objs:
+        if not o.geometries.geometries:
+            continue
+        c = await pose_in(robot, o.geometries.geometries[0].center, object_reference_frame(o), MOTION_REFERENCE_FRAME)
+        if math.dist((c.x, c.y, c.z), (gripper_pose.x, gripper_pose.y, gripper_pose.z)) < IN_GRIPPER_RADIUS_MM:
+            found.append(o)
+    return found
+
+
 def target_problem(w: Pose) -> Optional[str]:
     """Reason not to move to this world-frame object center, or None."""
     if not (TABLE_TOP_Z_MM - 40 <= w.z <= TABLE_TOP_Z_MM + 400):
@@ -474,7 +508,8 @@ class GraspJob:
         self.task: Optional[asyncio.Task] = None
         self.finished_at: Optional[float] = None
         self.holding: Optional[bool] = None
-        self.held: Optional[Held] = None      # set when the arm is holding the object
+        self.held: Optional[Held] = None      # what the gripper holds right now (kept current during a swap)
+        self.ok = False                       # the whole job succeeded
 
     @property
     def done(self) -> bool:
@@ -609,6 +644,51 @@ async def execute_grasp(motion: MotionClient, gripper: Gripper, arm: Arm, plan: 
     return True
 
 
+async def put_back(motion: MotionClient, gripper: Gripper, held: Held,
+                   obstacles: Optional[WorldState], job: GraspJob) -> bool:
+    """Set the held object down where it was picked up: above -> straight down
+    -> open -> straight up. The gripper opens only once the descent succeeded,
+    so a failed plan never drops it. True once it's released."""
+    g = held.pick_grasp
+    above = Pose(x=g.x, y=g.y, z=held.pick_approach.z, **held.orientation)
+    place = Pose(x=g.x, y=g.y, z=held.place_z, **held.orientation)
+    if not await move_to(motion, above, f"above where the {held.label} was", job, obstacles, upright()):
+        return False
+    if not await move_to(motion, place, f"put the {held.label} down", job, obstacles, straight_line()):
+        await move_to(motion, above, "back up", job, obstacles, straight_line())
+        return False
+    await open_gripper(gripper, job)
+    job.held = None                       # released: from here on the gripper is empty
+    await move_to(motion, above, "lift (straight up)", job, obstacles, straight_line())
+    return True
+
+
+async def run_put_back(motion: MotionClient, gripper: Gripper, held: Held, job: GraspJob) -> bool:
+    """P in demo mode: put the held object back and return to the observe pose."""
+    job.held = held
+    try:
+        if not await put_back(motion, gripper, held, held.obstacles, job):
+            job.status = f"couldn't put the {held.label} back; still holding it"
+            print(f"[grab] {job.status}")
+            return False
+        if held.home is not None:
+            await move_to(motion, held.home, "the observe pose", job,
+                          merge_world_states(held.obstacles, held.footprint), upright())
+        job.ok = True
+        job.status = f"put the {held.label} back"
+        print(f"[grab] {job.status}")
+        return True
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        raise
+    except Exception as e:
+        job.status = f"error: {e}"
+        print(f"[grab] {job.status}")
+        return False
+    finally:
+        job.finished_at = time.monotonic()
+
+
 async def capture_objects(segmenter: VisionClient):
     """3D objects from one segmenter capture."""
     try:
@@ -645,13 +725,25 @@ async def measure_tcp_mm(motion: MotionClient) -> float:
 
 async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int, frame_h: int,
                     segmenter: VisionClient, motion: MotionClient, gripper: Gripper, arm: Arm,
-                    box: Box, job: GraspJob, home: Optional[Pose], tcp_mm: float) -> bool:
+                    box: Box, job: GraspJob, home: Optional[Pose], tcp_mm: float,
+                    held: Optional[Held] = None, carry_back: bool = False) -> bool:
+    """Locate the locked object and pick it. With `held` (demo mode, the
+    gripper already has something), put that back where it came from first.
+    carry_back: return to the observe pose holding it (demo mode) instead of
+    hovering above the pick spot for the menu."""
+    job.held = held
     try:
         # Everything that depends on where the wrist camera is happens now,
         # before anything moves.
         current = await gripper_world_pose(motion)
         objs = await capture_objects(segmenter)
+        in_hand = await objects_in_gripper(robot, objs, current)
         target = await match_object_to_box(robot, objs, box, intr, frame_w, frame_h)
+        if target is not None and any(target is o for o in in_hand):
+            job.status = f"NOT MOVING: that's the {held.label if held else 'object'} already in the gripper"
+            print(f"[grab] {job.status}")
+            return False
+        objs = [o for o in objs if not any(o is h for h in in_hand)]
         if target is None:
             job.status = f"NOT MOVING: no 3D object where you locked '{box.label}' ({len(objs)} segmented)"
             print(f"[grab] {job.status}")
@@ -668,11 +760,22 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
             print(f"[grab] {job.status}")
             return False
         obstacles = await obstacles_in_world(robot, objs, target)
+        footprint = await obstacles_in_world(robot, [target], None)   # the target itself, also frozen now
         n = sum(len(g.geometries) for g in obstacles.obstacles) if obstacles else 0
         plan = plan_grasp(w, size, current, tcp_mm, home)
         print(f"[grab] {n} other object(s) as obstacles; fingertips {plan.fingertip_beyond_tcp_mm:.0f} mm "
               f"beyond the TCP; wrist o=({plan.orientation['o_x']:.2f}, {plan.orientation['o_y']:.2f}, "
               f"{plan.orientation['o_z']:.2f}) theta={plan.orientation['theta']:.1f}")
+        if held is not None:
+            # Swap: put the held object back first, avoiding everything on the
+            # table (the new target included); afterwards its spot is occupied
+            # again, so the new grasp avoids it too.
+            print(f"[grab] swap: putting the {held.label} back before picking the {object_label(target) or box.label}")
+            if not await put_back(motion, gripper, held, merge_world_states(obstacles, footprint), job):
+                job.status = f"couldn't put the {held.label} back; still holding it, nothing else picked"
+                print(f"[grab] {job.status}")
+                return False
+            obstacles = merge_world_states(obstacles, held.footprint)
         if not await execute_grasp(motion, gripper, arm, plan, obstacles, job):
             return False
         # The object was resting on the table, so setting it down anywhere on
@@ -680,7 +783,17 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         job.held = Held(label=object_label(target) or box.label, pick_grasp=plan.grasp,
                         pick_approach=plan.approach, orientation=plan.orientation, obstacles=obstacles,
                         place_z=plan.grasp.z + PLACE_CLEARANCE_MM, width_mm=plan.width_mm,
-                        pose=plan.approach, home=plan.return_pose)
+                        pose=plan.approach, home=plan.return_pose, footprint=footprint)
+        if carry_back and plan.return_pose is not None:
+            if await move_to(motion, plan.return_pose, "the observe pose (holding it)", job, obstacles, upright()):
+                job.held.pose = plan.return_pose
+            else:
+                job.status = f"holding the {job.held.label}, but couldn't get back to the observe pose"
+                print(f"[grab] {job.status}")
+                return False
+            job.status = (f"DRY RUN: holding the {job.held.label} (pretend)" if DRY_RUN
+                          else f"holding the {job.held.label}")
+        job.ok = True
         return True
     except asyncio.CancelledError:
         job.status = "cancelled"
@@ -691,6 +804,13 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         return False
     finally:
         job.finished_at = time.monotonic()
+
+
+def put_text(canvas, text: str, org: tuple[int, int], scale: float = 0.8,
+             color: tuple[int, int, int] = (255, 255, 255)) -> None:
+    """Text with a dark outline, readable on any camera image."""
+    cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
 
 
 def report_task_exception(task: asyncio.Task) -> None:
@@ -846,6 +966,7 @@ async def main():
     feed = RobotFeed(cam, detector)
     job: Optional[GraspJob] = None
     session: Optional[DeliverySession] = None
+    held: Optional[Held] = None     # demo mode: what the gripper has between picks
     live_blocked_until = 0.0
     hovered, progress = None, 0.0
 
@@ -864,7 +985,8 @@ async def main():
                 print("[main] --skip-calibration: reusing head_range.json")
         estimator = GazeEstimator(gaze, calib)
         delivery_io = make_delivery_io(machine, motion, gripper, arm, intr, frame_w, frame_h)
-        print(f"[main] user profile '{USER_PROFILE}'"
+        print(f"[main] {'menu' if MENU else 'demo (pick, then look at another object to swap)'} mode, "
+              f"user profile '{USER_PROFILE}'"
               + (f", serving at ({serve.x:.0f}, {serve.y:.0f}, {serve.z:.0f})" if serve else ""))
         feed.start()
 
@@ -890,6 +1012,25 @@ async def main():
                     live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
                 continue
 
+            if job is not None and not lock.is_locked:
+                # P (operator): putting the held object back; no gaze lock involved.
+                feed.paused = True
+                view = (feed.obs.frame * 0.5).astype(np.uint8)
+                for i, line in enumerate([job.status, "Q stop+quit"]):
+                    put_text(view, line, (16, 40 + 36 * i), 0.8)
+                cv2.imshow(WINDOW, view)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    await stop_everything(arm, job)
+                    break
+                if job.done and (job.ok or time.monotonic() - job.finished_at > RELEASE_AFTER_SECONDS):
+                    held = job.held
+                    job = None
+                    estimator.reset()
+                    live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
+                await asyncio.sleep(0.03)
+                continue
+
             if lock.is_locked:
                 feed.paused = True   # don't compete with segmentation/planning for the machine's CPU
                 lines = [job.status] if job else []
@@ -899,14 +1040,19 @@ async def main():
                 if key == ord("q"):
                     await stop_everything(arm, job)
                     break
-                if job is not None and job.done and job.held is not None:
+                if job is not None and job.done and not MENU:
+                    held = job.held   # what the gripper has now (a swap may have put one down)
+                if job is not None and job.done and job.held is not None and MENU:
                     session = DeliverySession(delivery_io, job.held, serve,
                                               head_mode=USER_PROFILE == "head", head_range=head_range)
                     print(f"[deliver] holding the {job.held.label}: showing the menu")
                     job = None
                     continue
                 if job is not None and job.done:
-                    if key == ord("r") or time.monotonic() - job.finished_at > RELEASE_AFTER_SECONDS:
+                    # Demo mode: straight back to choosing after a success;
+                    # after a failure, leave the reason up for a few seconds.
+                    if ((job.ok and not MENU) or key == ord("r")
+                            or time.monotonic() - job.finished_at > RELEASE_AFTER_SECONDS):
                         lock.release()
                         estimator.reset()
                         job = None
@@ -931,7 +1077,7 @@ async def main():
                 job = GraspJob()
                 job.task = asyncio.create_task(run_grasp(
                     machine, intr, frame_w, frame_h, segmenter, motion, gripper, arm,
-                    locked.box, job, home, tcp_mm))
+                    locked.box, job, home, tcp_mm, held=held, carry_back=not MENU))
                 job.task.add_done_callback(report_task_exception)
                 continue
 
@@ -945,6 +1091,9 @@ async def main():
             elif cooling:
                 cv2.putText(view, f"Ready in {live_blocked_until - time.monotonic():.1f}s", (16, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+            if held is not None:
+                put_text(view, f"Holding: {held.label}{' (pretend)' if DRY_RUN else ''}  -  look at another "
+                               "object to swap   |   P: put it back", (16, 66), 0.7, (0, 230, 0))
             hud = (f"{'EXECUTE' if EXECUTE else 'DRY RUN'} | "
                    f"{'paired' if feed.paired else 'UNPAIRED'} capture {feed.fps:.1f}/s "
                    f"({feed.capture_ms:.0f} ms) | {len(boxes)} boxes")
@@ -954,6 +1103,13 @@ async def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("p") and held is not None and not MENU:
+                lock.release()
+                job = GraspJob()
+                job.status = f"putting the {held.label} back"
+                job.task = asyncio.create_task(run_put_back(motion, gripper, held, job))
+                job.task.add_done_callback(report_task_exception)
+                continue
             if key == ord("c"):
                 feed.paused = True
                 calib = run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True,
@@ -965,6 +1121,8 @@ async def main():
             await stop_everything(arm, job)
         if session is not None and session.busy:
             await session.stop("Quit")
+        if held is not None and not DRY_RUN:
+            print(f"[main] note: the gripper is still holding the {held.label}")
         gaze.close()
         cv2.destroyAllWindows()
         await machine.close()

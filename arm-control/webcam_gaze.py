@@ -11,10 +11,11 @@ Design notes:
   plus their products. When the head turns left while the eyes stay on the
   same screen point, the irises rotate right inside the head; only a model
   that sees BOTH can tell that apart from actually looking right.
-- Calibration therefore runs in stages: head straight, then turned left,
-  right, up, down, with the 9 targets at each. One stage would leave the head
-  features constant and their weights arbitrary (the "move your head and the
-  dot jumps" failure). --quick-calibration = straight only.
+- Calibration therefore runs in stages: head still (a 5x5 grid, eyes only),
+  then eight directions where the head follows the eyes slightly, two targets
+  each. One stage would leave the head features constant and their weights
+  arbitrary (the "move your head and the dot jumps" failure).
+  --quick-calibration = straight only.
 - Blinks: per-user threshold from an open-eye baseline; blink frames are
   skipped while calibrating, and live the cursor holds until the eyes are
   fully open again for a moment (the reopening lids corrupt the iris fit).
@@ -70,7 +71,6 @@ OUT_OF_RANGE_MARGIN = 0.15        # prediction beyond the window by more than th
 # then ring by ring outward, each ring walked around its perimeter (short hops).
 CAL_MARGIN = 0.15
 STRAIGHT_GRID_N = 5   # the head pose used most: dense, so mid-diagonals and interior points are measured
-TURNED_GRID_N = 3     # turned stages only teach the head/eye coupling; 3x3 is enough
 
 
 def grid_targets(n: int) -> list[tuple[float, float]]:
@@ -86,59 +86,33 @@ def grid_targets(n: int) -> list[tuple[float, float]]:
     return [p for _, _, p in pts]
 
 
-CALIBRATION_TARGETS = grid_targets(TURNED_GRID_N)
-# Head-pose stages: (name, instruction, {axis: (direction, minimum |change| from
-# the straight pose)}, extra targets). Diagonals need both axes moved. The extra
-# targets are the interior midpoint(s) on the side the head is turned toward
-# (halfway from the center to that edge or corner): the 3x3 grid never samples
-# them, and when the head faces that region the eyes are near neutral there.
-# Add more tuples to a stage's list to sample its region denser.
-YAW_STEP, PITCH_STEP = 0.10, 0.06
-NEAR, MID, FAR = 0.325, 0.5, 0.675   # the 5x5 grid's interior levels
-LEFT, RIGHT, UP, DOWN = ("yaw", ("left", YAW_STEP)), ("yaw", ("right", YAW_STEP)), \
-    ("pitch", ("up", PITCH_STEP)), ("pitch", ("down", PITCH_STEP))
+# Head-pose stages: (name, where, targets). The straight stage is the 5x5 grid
+# with the head still, eyes only. Each directional stage starts with a
+# "turn your head" step (webcam view, an arrow, the instruction): a SLIGHT
+# turn toward that side, like an attention shift, not a full turn. Then two
+# dots: the midpoint toward that side and the edge/corner, e.g. up-left =
+# upper-middle-left and upper-left. Those same points are also in the straight
+# grid, so the model sees each one with and without the head's help, which is
+# what teaches it the head/eye coupling.
+# The turn step is timed, not gated: an earlier version waited for a measured
+# turn and learned left/up from the first stage, which subtle movements never
+# reached, so its gauge accepted any direction. Space starts the dots early.
+LO, NEAR, MID, FAR, HI = (float(v) for v in np.linspace(CAL_MARGIN, 1 - CAL_MARGIN, STRAIGHT_GRID_N))
 HEAD_STAGES = [
-    ("straight", "Face the screen straight on", {}, []),
-    ("left", "Turn your head a little to the LEFT and hold it there", dict([LEFT]), [(NEAR, MID)]),
-    ("right", "Turn your head a little to the RIGHT and hold it there", dict([RIGHT]), [(FAR, MID)]),
-    ("up", "Tilt your head a little UP and hold it there", dict([UP]), [(MID, NEAR)]),
-    ("down", "Tilt your head a little DOWN and hold it there", dict([DOWN]), [(MID, FAR)]),
-    ("up-left", "Turn a little LEFT and tilt a little UP, and hold it there", dict([LEFT, UP]), [(NEAR, NEAR)]),
-    ("up-right", "Turn a little RIGHT and tilt a little UP, and hold it there", dict([RIGHT, UP]), [(FAR, NEAR)]),
-    ("down-left", "Turn a little LEFT and tilt a little DOWN, and hold it there", dict([LEFT, DOWN]), [(NEAR, FAR)]),
-    ("down-right", "Turn a little RIGHT and tilt a little DOWN, and hold it there", dict([RIGHT, DOWN]), [(FAR, FAR)]),
+    ("straight", "", None),
+    ("up-left", "UPPER LEFT", [(NEAR, NEAR), (LO, LO)]),
+    ("up", "TOP", [(MID, NEAR), (MID, LO)]),
+    ("up-right", "UPPER RIGHT", [(FAR, NEAR), (HI, LO)]),
+    ("right", "RIGHT", [(FAR, MID), (HI, MID)]),
+    ("down-right", "LOWER RIGHT", [(FAR, FAR), (HI, HI)]),
+    ("down", "BOTTOM", [(MID, FAR), (MID, HI)]),
+    ("down-left", "LOWER LEFT", [(NEAR, FAR), (LO, HI)]),
+    ("left", "LEFT", [(NEAR, MID), (LO, MID)]),
 ]
-OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
-
-
-def expected_sign(learned: dict[str, float], direction: str) -> Optional[float]:
-    """Which sign of the head-pose proxy means `direction`. The first stage on
-    each axis defines it (the proxy's sign convention depends on the mirrored
-    camera image), then the opposite and diagonal stages must match it."""
-    if direction in learned:
-        return learned[direction]
-    if OPPOSITE[direction] in learned:
-        return -learned[OPPOSITE[direction]]
-    return None
-
-
-def head_stage_progress(required: dict, deltas: dict[str, float],
-                        learned: dict[str, float]) -> tuple[float, bool]:
-    """(fraction of the way to the required pose, 1 = there; turned the wrong way)."""
-    fractions, wrong_way = [], False
-    for axis, (direction, step) in required.items():
-        want = expected_sign(learned, direction)
-        d = deltas[axis]
-        if want is not None and d * want < 0:
-            wrong_way = True
-            fractions.append(0.0)
-        else:
-            fractions.append(abs(d) / step)
-    return min(fractions), wrong_way
-HEAD_HOLD_S = 0.8          # head must be turned enough and steady this long before a stage starts
-HEAD_MAX_WAIT_S = 12.0     # ...or the stage starts anyway with whatever pose is held
-CAL_PREROLL_S = 0.6
-CAL_SETTLE_S = 0.45
+CAL_PREROLL_S = 0.6        # the first dot shows this long before capture
+CAL_SETTLE_S = 0.45        # eyes only: a saccade settles fast
+HEAD_TURN_S = 3.0          # "turn your head slightly" step before a directional stage (Space skips ahead)
+HEAD_SETTLE_S = 0.6        # directional stages: a little longer per dot
 CAL_MIN_SAMPLES = 8
 CAL_TARGET_SAMPLES = 12
 CAL_MAX_CAPTURE_S = 2.0
@@ -213,6 +187,7 @@ def gaze_features(landmarks) -> Optional[np.ndarray]:
 
 
 N_FEATURES = 18
+HEAD_YAW, HEAD_PITCH = 9, 10    # where gaze_features puts the head-pose proxies
 
 
 def eye_aspect_ratio(landmarks) -> float:
@@ -316,7 +291,8 @@ def eyes_strip(frame, landmarks, height: int = 240) -> np.ndarray:
 def _draw_status(canvas, message: str, y_from_bottom: int = 24) -> None:
     h = canvas.shape[0]
     cv2.putText(canvas, message, (16, h - y_from_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(canvas, message, (16, h - y_from_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
+    # Same weight as the outline: OpenCV 5 draws 1-px text in a narrower face, so it wouldn't line up.
+    cv2.putText(canvas, message, (16, h - y_from_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2, cv2.LINE_AA)
 
 
 def _draw_target(canvas, point_px, progress: float, settling: bool) -> None:
@@ -325,6 +301,25 @@ def _draw_target(canvas, point_px, progress: float, settling: bool) -> None:
     cv2.circle(canvas, (x, y), 26, color, 3, cv2.LINE_AA)
     cv2.circle(canvas, (x, y), max(2, int(20 * progress)), color, -1, cv2.LINE_AA)
     cv2.circle(canvas, (x, y), 3, (0, 0, 0), -1, cv2.LINE_AA)
+
+
+def _draw_turn_prompt(canvas, where: str, dx: int, dy: int, seconds_left: float) -> None:
+    """Big instruction + an arrow from the center toward that side (the view is
+    mirrored, so screen-left is the user's left) + the countdown to the dots."""
+    h, w = canvas.shape[:2]
+    lines = [(f"Turn your head SLIGHTLY toward the {where}", 1.1), ("a small turn, not a full one", 0.8),
+             (f"dots start in {math.ceil(seconds_left)}s", 0.8)]
+    for i, (text, scale) in enumerate(lines):
+        size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 3)[0]
+        org = ((w - size[0]) // 2, 60 + 48 * i)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 6, cv2.LINE_AA)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255) if i == 0 else (240, 240, 240),
+                    3, cv2.LINE_AA)
+    cx, cy = w // 2, h // 2 + 40
+    length = 170 / math.hypot(dx, dy)
+    tip = (int(cx + dx * length), int(cy + dy * length))
+    cv2.arrowedLine(canvas, (cx, cy), tip, (0, 0, 0), 16, cv2.LINE_AA, tipLength=0.3)
+    cv2.arrowedLine(canvas, (cx, cy), tip, (0, 255, 255), 9, cv2.LINE_AA, tipLength=0.3)
 
 
 @dataclass
@@ -522,11 +517,11 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                      window_name: str = "Gaze Calibration",
                      keep_window: bool = False,
                      quick: bool = False) -> GazeCalibration:
-    """Framing gate -> for each head pose (straight, left, right, up, down):
-    turn-and-hold -> pre-roll on the center dot -> 9 targets. quick=True does
-    the straight stage only (fine if the head will stay still).
+    """Framing gate -> the straight stage (5x5 grid, head still) -> eight
+    directional stages (two dots each, the head follows the eyes slightly).
+    quick=True does the straight stage only (fine if the head will stay still).
 
-    Keys during calibration: S skips the current head-pose stage, Q/ESC cancels.
+    Keys during calibration: S skips the current stage, Q/ESC cancels.
     """
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     stages = HEAD_STAGES[:1] if quick else HEAD_STAGES
@@ -591,78 +586,55 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
     print(f"[calibration] EAR baseline {baseline if baseline else float('nan'):.3f} -> blink < {blink_ear:.3f}, "
           f"open > {open_ear:.3f}; straight head yaw={yaw0:+.3f} pitch={pitch0:+.3f}")
     gate = BlinkGate(blink_ear, open_ear)
-    learned_sign: dict[str, float] = {}   # direction name -> sign of the head-pose proxy change
 
     all_features: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
 
-    for stage_idx, (name, instruction, required, extra) in enumerate(stages):
-        stage_label = f"Head {stage_idx + 1}/{len(stages)}: {name}"
-        grid = grid_targets(TURNED_GRID_N if required else STRAIGHT_GRID_N)
-        # Center first, then the stage's extra interior point(s) (a short hop
-        # from the center), then the grid ring(s).
-        targets = [grid[0], *[p for p in extra if p not in grid], *grid[1:]]
+    for stage_idx, (name, where, stage_targets) in enumerate(stages):
+        stage_label = f"Stage {stage_idx + 1}/{len(stages)}: {name}   |   S = skip this stage"
+        head_follows = stage_targets is not None
+        targets = stage_targets if head_follows else grid_targets(STRAIGHT_GRID_N)
+        settle_s = HEAD_SETTLE_S if head_follows else CAL_SETTLE_S
+        instruction = (f"Keep your head turned slightly toward the {where}; follow the dots with your eyes"
+                       if head_follows else "Keep your head still and follow the dot with your eyes")
+        skipped = False
 
-        # Phase 2: get the head into this stage's pose and hold it.
-        if required:
-            held_since: Optional[float] = None
-            wait_started = time.monotonic()
-            skipped = False
-            deltas = {"yaw": 0.0, "pitch": 0.0}
-            reached = False
-            while True:
-                frame, landmarks, _, _ = tracker.read()
-                now = time.monotonic()
+        # Turn-your-head step: timed, never waits on a measured head angle.
+        if head_follows:
+            dx = -1 if "left" in name else (1 if "right" in name else 0)
+            dy = -1 if "up" in name else (1 if "down" in name else 0)
+            t0 = time.monotonic()
+            while (left := HEAD_TURN_S - (time.monotonic() - t0)) > 0:
+                frame, _, _, _ = tracker.read()
                 canvas = face_canvas(frame)
-                fraction, wrong_way = 0.0, False
-                if landmarks is not None:
-                    yaw, pitch = head_pose_proxies(landmarks)
-                    deltas = {"yaw": yaw - yaw0, "pitch": pitch - pitch0}
-                    fraction, wrong_way = head_stage_progress(required, deltas, learned_sign)
-                turned = landmarks is not None and fraction >= 1.0
-                if turned:
-                    held_since = held_since or now
-                else:
-                    held_since = None
-                holding_for = now - held_since if held_since else 0.0
-                bar_w = int(min(1.0, fraction) * 300)
-                bar_color = (0, 200, 0) if turned else ((0, 0, 255) if wrong_way else (0, 165, 255))
-                cv2.rectangle(canvas, (16, 60), (316, 84), (60, 60, 60), -1)
-                cv2.rectangle(canvas, (16, 60), (16 + bar_w, 84), bar_color, -1)
-                cv2.putText(canvas, stage_label, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                hint = "  (hold...)" if turned else ("  (other way!)" if wrong_way else "")
-                _draw_status(canvas, instruction + hint + "   |   S = skip this pose", 24)
+                _draw_turn_prompt(canvas, where, dx, dy, left)
+                _draw_status(canvas, stage_label, 52)
+                _draw_status(canvas, "Space = ready now")
                 key = show(canvas)
                 if key == ord("s"):
                     skipped = True
                     break
-                if turned and holding_for >= HEAD_HOLD_S:
-                    reached = True
+                if key == ord(" "):
                     break
-                if now - wait_started > HEAD_MAX_WAIT_S and landmarks is not None:
-                    print(f"[calibration] {name}: head not turned enough after {HEAD_MAX_WAIT_S:.0f}s, using the current pose")
-                    break
-            if skipped:
-                print(f"[calibration] stage '{name}' skipped")
-                continue
-            if reached:
-                for axis, (direction, _) in required.items():
-                    if expected_sign(learned_sign, direction) is None and deltas[axis] != 0:
-                        learned_sign[direction] = math.copysign(1.0, deltas[axis])
 
-        # Phase 3: pre-roll on the center dot.
-        cx, cy = int(targets[0][0] * frame_w), int(targets[0][1] * frame_h)
+        # Pre-roll: the first dot (not captured yet) and the instruction.
+        fx, fy = int(targets[0][0] * frame_w), int(targets[0][1] * frame_h)
         t0 = time.monotonic()
-        while time.monotonic() - t0 < CAL_PREROLL_S:
+        while not skipped and time.monotonic() - t0 < CAL_PREROLL_S:
             frame, landmarks, _, _ = tracker.read()
             canvas = eyes_canvas(frame, landmarks)
-            _draw_target(canvas, (cx, cy), 0.0, settling=True)
-            _draw_status(canvas, f"{stage_label} - keep your head there, follow the dot with your eyes only")
-            show(canvas)
+            _draw_target(canvas, (fx, fy), 0.0, settling=True)
+            _draw_status(canvas, stage_label, 52)
+            _draw_status(canvas, instruction)
+            if show(canvas) == ord("s"):
+                skipped = True
+                break
 
-        # Phase 4: the targets.
-        stage_ok = 0
+        # The targets.
+        stage_ok, stage_heads = 0, []
         for idx, (tx, ty) in enumerate(targets):
+            if skipped:
+                break
             px, py = int(tx * frame_w), int(ty * frame_h)
             samples: list[np.ndarray] = []
             started = time.monotonic()
@@ -670,7 +642,7 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
             while True:
                 frame, landmarks, feats, ear = tracker.read()
                 now = time.monotonic()
-                settling = now - started < CAL_SETTLE_S
+                settling = now - started < settle_s
                 fully_open, blinking = gate.update(ear, now)
                 if not settling:
                     capture_started = capture_started or now
@@ -680,19 +652,32 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
                 _draw_target(canvas, (px, py), min(1.0, len(samples) / CAL_TARGET_SAMPLES), settling)
                 if blinking:
                     cv2.circle(canvas, (px, py), 34, (0, 120, 255), 2, cv2.LINE_AA)
-                _draw_status(canvas, f"{stage_label}   target {idx + 1}/{len(targets)}")
-                show(canvas)
+                _draw_status(canvas, f"{stage_label}   |   dot {idx + 1}/{len(targets)}", 52)
+                _draw_status(canvas, instruction)
+                if show(canvas) == ord("s"):
+                    skipped = True
+                    break
                 if len(samples) >= CAL_TARGET_SAMPLES:
                     break
                 if capture_started is not None and now - capture_started > CAL_MAX_CAPTURE_S:
                     break
+            if skipped:
+                break
             if len(samples) >= CAL_MIN_SAMPLES:
-                all_features.append(np.median(samples, axis=0))
+                feat = np.median(samples, axis=0)
+                all_features.append(feat)
                 all_targets.append(np.array([px, py], dtype=np.float64))
+                stage_heads.append(feat[[HEAD_YAW, HEAD_PITCH]])
                 stage_ok += 1
             else:
-                print(f"[calibration] {name} target {idx + 1} skipped: only {len(samples)} clean samples")
-        print(f"[calibration] stage '{name}': {stage_ok}/{len(targets)} targets")
+                print(f"[calibration] {name} dot {idx + 1} skipped: only {len(samples)} clean samples")
+        if skipped:
+            print(f"[calibration] stage '{name}' skipped")
+            continue
+        # For the record only (nothing is gated on it): how far the head moved.
+        moved = (f"; head moved yaw {np.mean(stage_heads, axis=0)[0] - yaw0:+.3f}, "
+                 f"pitch {np.mean(stage_heads, axis=0)[1] - pitch0:+.3f} from straight" if stage_heads else "")
+        print(f"[calibration] stage '{name}': {stage_ok}/{len(targets)} dots{moved}")
 
     finish_window()
     if len(all_features) < 6:
@@ -704,6 +689,6 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
     calib.save()
     pred = ((np.vstack(all_features) - mean) / std) @ mapping
     err = float(np.mean(np.linalg.norm(pred - np.vstack(all_targets), axis=1)))
-    print(f"[calibration] done: {len(all_features)} targets over {len(stages)} head pose(s), "
+    print(f"[calibration] done: {len(all_features)} dots over {len(stages)} stage(s), "
           f"mean fit error {err:.1f}px, saved to {CALIBRATION_PATH}")
     return calib

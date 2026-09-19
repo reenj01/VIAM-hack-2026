@@ -76,6 +76,7 @@ class Held:
     width_mm: float
     pose: Pose                # where the TCP is now (last commanded)
     home: Optional[Pose]      # observe pose to return to
+    footprint: Optional[WorldState] = None   # the object itself where it was picked (world), for re-avoiding it
 
 
 class Status:
