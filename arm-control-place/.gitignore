@@ -1,0 +1,6 @@
+# Same per-machine files the original arm-control/ keeps out of git
+home_pose.json
+serve_pose.json
+head_range.json
+runs/
+dataset/
