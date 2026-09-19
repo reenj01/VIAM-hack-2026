@@ -12,7 +12,7 @@ an importable module.
 
 | file | role |
 | --- | --- |
-| `webcam_gaze.py` | webcam + MediaPipe iris tracking, framing gate, 9-point calibration, smoothing, dwell timer |
+| `webcam_gaze.py` | webcam + MediaPipe iris tracking, framing gate, calibration, smoothing, dwell timer |
 | `gaze_lock.py` | gaze vs. detection boxes: hover, dwell, lock with frozen snapshot, drawing |
 | `main.py` | the robot pipeline (Viam camera, YOLO detector, segmenter, motion, gripper) |
 | `local_demo.py` | the same gaze → box lock-on with a local YOLO on a photo/video, no robot needed |
@@ -42,8 +42,10 @@ recalibrates, Q quits.
 
 ## Run against the robot
 
-Fill in `API_KEY`, `API_KEY_ID`, `ADDRESS`, and the service/component names at
-the top of `main.py` from your Viam app, then:
+Copy `../.env.example` to `arm-control/.env` and fill in
+`VIAM_MACHINE_ADDRESS`, `VIAM_API_KEY_ID` and `VIAM_API_KEY` from your Viam app
+(plain values, no quotes or `<>`; the file is gitignored). Check the
+service/component names at the top of `main.py`, then:
 
 ```bash
 python main.py              # dry run: everything except motion, prints the poses
@@ -55,13 +57,20 @@ segmentation, transforms and safety checks all run and every pose is printed,
 but nothing is sent to the arm or gripper. `Q` cancels a grasp and sends
 `arm.stop()`, best effort; the physical E-stop is the real stop.
 
-Every run starts with the face-framing oval, then calibration in nine
-head-pose stages (straight; turned left, right, up, down; and the four
-diagonals). The straight stage uses a 5x5 grid; each turned stage uses 3x3
-plus the interior point on the side the head faces (~105 s; `S` skips a
-stage). The first left/up stage fixes which way is which, so a stage turned
-the wrong way isn't accepted. `--quick-calibration` does the straight stage
-only; `--skip-calibration` reuses the last one; `C` recalibrates mid-run.
+Every run starts with the face-framing oval, then calibration (~50 s):
+
+1. **Head still**, eyes only: a 5x5 grid of dots.
+2. **Eight directions** (upper left, top, upper right, right, lower right,
+   bottom, lower left, left), two dots each: the midpoint toward that side,
+   then the edge or corner (e.g. upper-middle-left, then upper-left). Look at
+   them and let your head turn *slightly* with your eyes, the way it does
+   when your attention moves somewhere. No full head turns.
+
+Nothing measures or waits on the head angle; the user is trusted to look at
+the dots. Because the same points are also in the head-still grid, the model
+learns how much of a look comes from the eyes and how much from the head.
+`S` skips a stage. `--quick-calibration` does the head-still stage only;
+`--skip-calibration` reuses the last one; `C` recalibrates mid-run.
 Blinks neither add nor remove selection evidence, and the cursor holds until
 the eyes are fully open again. Keep the window where it is after calibrating:
 the gaze mapping is to pixels on your physical screen.
@@ -85,11 +94,33 @@ the gaze mapping is to pixels on your physical screen.
    straight-line descent -> close to the object's width -> straight up ->
    carried back level.
 
-## After the pick: two user profiles
+## Demo mode (default): pick, then swap
 
-After a successful grasp the arm hovers, holding the object, and the screen
-turns into a big gaze menu (`delivery.py`). Live object selection is off
-while holding, so a second selection can't drop what's in the gripper.
+For the demo there are exactly two gaze actions:
+
+1. **Look at an object and hold**: the arm picks it up and carries it back to
+   the observe pose, still holding it, so the camera sees the table again.
+2. **While holding, look at a different object and hold**: the arm puts the
+   held one back down where it came from, then picks up the new one.
+
+It uses the same dwell as a normal pick, so a passing glance doesn't
+trigger a swap. The new object (and every other one) is located and frozen
+into world coordinates *before* anything moves; the put-back avoids the new
+object, and the new grasp avoids the spot the old one went back to. The
+object in the gripper, if the wrist camera sees it, is never a target or an
+obstacle. If the put-back can't be planned the arm backs up and keeps
+holding. The gripper only opens once the object is down.
+
+`P` (keyboard, for the operator) puts the held object back without picking
+another, e.g. to reset between demos. Q stops and quits; the arm keeps
+holding whatever it has.
+
+## `--menu`: the post-pick menu and the two user profiles
+
+With `--menu`, after a successful grasp the arm hovers, holding the object,
+and the screen turns into a big gaze menu (`delivery.py`). Live object
+selection is off while holding, so a second selection can't drop what's in
+the gripper.
 
 ```
 Bring to me   Raise          Closer   Put it back
@@ -110,7 +141,7 @@ Let go        Lower          Away     Steer with head   (--user head)
 - Every target is clamped: never below the height that rests the object on
   the table, never past the serve pose toward the user, within reach.
 
-`--user head` (for users with some head movement) adds a per-user head-range
+`--user head` (for users with some head movement; implies `--menu`) adds a per-user head-range
 calibration at startup (hold still, then turn left/right and tilt up/down as
 far as is comfortable; S if a direction isn't possible) and **Steer with
 head** (`head_control.py`): turn/tilt your head to move the object in small
@@ -128,7 +159,7 @@ Setup, once, with the arm parked where the user should receive objects
 
 ```bash
 python main.py --set-serve
-python main.py                    # eyes profile (dry run)
+python main.py --menu             # eyes profile (dry run)
 python main.py --user head        # head + eyes profile (dry run)
 ```
 
