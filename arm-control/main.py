@@ -31,21 +31,13 @@ P (demo mode, operator) put the held object back without picking another.
 Flags: --execute (allow motion), --menu, --user eyes|head, --skip-calibration (reuse
 the last calibration), --quick-calibration (straight-head stage only), --detector NAME,
 --set-home, --set-serve (record where objects are brought to the user).
---go-home-on-start (opt in to moving to the saved pose at launch).
---finger-clearance-mm N (override measured fingertip-to-body space),
---max-finger-extension-mm N (longest body-to-tip extension over the jaw stroke),
---gripper-body-from-flange-mm N (fixed flange-to-body-underside distance),
---grasp-z-offset-mm N (additional upward offset).
---object-width-mm LABEL=MM (explicit measured width for this label in this run).
 """
 
-import argparse
 import asyncio
 import json
 import math
 import os
 import sys
-import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,14 +56,10 @@ from viam.services.vision import VisionClient
 from viam.services.motion import MotionClient
 from viam.proto.common import GeometriesInFrame, Geometry, Pose, PoseInFrame, WorldState
 from viam.proto.service.motion import Constraints, LinearConstraint, OrientationConstraint
-from viam.spatialmath import Quaternion
 
 from delivery import PLACE_CLEARANCE_MM, DeliveryIO, DeliverySession, Held, user_axes
 from gaze_lock import IGNORE_LABELS, Box, GazeLockController, draw_live, draw_locked, filter_background_boxes
 from head_control import HeadRange, calibrate_head_range
-from grasp_checks import load_grasp_model, check_model_clearance
-from action_recovery import OperatorFault, check_action_recovery, is_session_expired
-from joint_checks import JointRangeError, require_arm_joint_ranges
 from webcam_gaze import (
     CALIBRATION_PATH,
     GazeCalibration,
@@ -110,8 +98,7 @@ CAMERA_NAME = "cam"
 # Any vision service works here; they all return boxes + labels. objects-3d's
 # own `detector_name` attribute (Viam app config) must point at the same one,
 # or its 3D objects won't correspond to the boxes on screen.
-DETECTOR_CANDIDATES = ("vision-1", "yolo-detector", "shape-detector")   # mlmodel, viam-labs:yolov8, devrel:shape-finder
-# vision-1 (the team's trained model) is what objects-3d's detector_name points at on this machine.
+DETECTOR_CANDIDATES = ("yolo-detector", "shape-detector")   # viam-labs:yolov8, devrel:shape-finder
 DETECTOR_NAME = DETECTOR_CANDIDATES[0]
 if "--detector" in sys.argv:                               # python main.py --detector shape-detector
     DETECTOR_NAME = sys.argv[sys.argv.index("--detector") + 1]
@@ -126,97 +113,20 @@ RECONNECT_DELAY_S = 2.0
 MOTION_REFERENCE_FRAME = "world"
 
 # --- Geometry of this machine (hackathon fragment, read with `viam fragment get`) ---
-# The configured TCP sits 150 mm from the flange. The housing is rigid, but
-# the hinged fingers change extension as they close. Calibrate the fixed body
-# datum and the full finger-extension range; do not assume a 165 mm tool tip.
+# The gripper frame sits 150 mm out from the arm flange (not 105 as in the
+# crash-course deck), i.e. already near the finger pads. The fingertips of the
+# UFactory gripper are ~165 mm out (workshop: 105 mm TCP + 60 mm fingers), so
+# they extend FINGERTIP_FROM_FLANGE_MM - tcp beyond the TCP. The TCP distance is
+# measured from the machine at startup; GRIPPER_TCP_FROM_FLANGE_MM is only the
+# fallback. Measure the fingertip number with a tape if grasps land high/low.
+FINGERTIP_FROM_FLANGE_MM = 165.0
 GRIPPER_TCP_FROM_FLANGE_MM = 150.0
-# User measured the fixed mounting-face -> housing-underside distance as
-# approximately 3.85 inches (97.79 mm). This is NOT a fingertip measurement.
-MEASURED_GRIPPER_BODY_FROM_FLANGE_MM = 97.8
-# Housing underside -> finger ends: 2.3 inches fully open, 2.75 closed.
-# Round the minimum down and maximum up to 0.1 mm for the planning bounds.
-MEASURED_MIN_FINGER_EXTENSION_MM = 58.4
-MEASURED_MAX_FINGER_EXTENSION_MM = 69.9
 # The table obstacle is a 200 mm box centered at world z = -123: top at -23.
 TABLE_TOP_Z_MM = -23.0
-# But the wrist depth camera sees the real table surface at z = +3..+7 mm
-# (measured three times on 2026-09-19 from different arm poses). The object
-# heights come from that same camera, so the fingertip floor uses the higher of
-# the two; a too-high floor only makes flat objects ungraspable, never a crash.
-MEASURED_TABLE_TOP_Z_MM = 5.0
 FINGERTIP_TABLE_CLEARANCE_MM = 10.0
 ARM_REACH_MM = 700.0                 # xArm6
 APPROACH_HEIGHT_MM = 100.0           # standoff above the grasp pose
-FINGER_INSERTION_MM = 15.0          # shallow engagement below the object's top, not its center
-GRIPPER_BODY_CLEARANCE_MM = 15.0    # body must remain this far above the object's top
-DEFAULT_RETURN_HEIGHT_ABOVE_TABLE_MM = 355.6   # 14 inches if no home was taught
-MIN_RELEASE_RETREAT_MM = 40.0
-MOTION_WAIT_REPORT_S = 5.0
-GRASP_ARRIVAL_POSITION_MM = 5.0
-GRASP_ARRIVAL_ANGLE_DEG = 2.0
-TARGET_REPEAT_POSITION_MM = 10.0
-TARGET_REPEAT_SIZE_MM = 10.0
-
-
-def grasp_settings(argv):
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--grasp-z-offset-mm", type=float, default=0.0)
-    parser.add_argument("--finger-clearance-mm", type=float, default=MEASURED_MIN_FINGER_EXTENSION_MM)
-    parser.add_argument("--max-finger-extension-mm", type=float, default=MEASURED_MAX_FINGER_EXTENSION_MM)
-    parser.add_argument("--gripper-body-from-flange-mm", type=float,
-                        default=MEASURED_GRIPPER_BODY_FROM_FLANGE_MM)
-    parser.add_argument("--object-width-mm", action="append", default=[], metavar="LABEL=MM")
-    args, _ = parser.parse_known_args(argv)
-    widths = {}
-    for spec in args.object_width_mm:
-        label, separator, raw = spec.partition("=")
-        try:
-            value = float(raw)
-        except ValueError:
-            parser.error("--object-width-mm must be LABEL=MM, for example block=28.6")
-        if not separator or not label.strip() or not math.isfinite(value) or not 1 < value <= 85:
-            parser.error("--object-width-mm needs a label and a measured width above 1 and at most 85 mm")
-        widths[label.strip().lower()] = value
-    args.object_width_mm = widths
-    if not math.isfinite(args.grasp_z_offset_mm) or args.grasp_z_offset_mm < 0:
-        parser.error("--grasp-z-offset-mm must be a finite, nonnegative upward offset")
-    if args.finger_clearance_mm is not None and (
-            not math.isfinite(args.finger_clearance_mm)
-            or args.finger_clearance_mm <= GRIPPER_BODY_CLEARANCE_MM):
-        parser.error(f"--finger-clearance-mm must exceed the {GRIPPER_BODY_CLEARANCE_MM:g} mm body clearance")
-    for name in ("max_finger_extension_mm", "gripper_body_from_flange_mm"):
-        value = getattr(args, name)
-        if value is not None and (not math.isfinite(value) or value <= 0):
-            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
-    if (args.max_finger_extension_mm is not None and args.finger_clearance_mm is not None
-            and args.max_finger_extension_mm < args.finger_clearance_mm):
-        parser.error("maximum finger extension cannot be less than minimum finger clearance")
-    return args
-
-
-_grasp_settings = grasp_settings(sys.argv[1:])
-GRASP_Z_OFFSET_MM = _grasp_settings.grasp_z_offset_mm
-# Minimum/maximum axial tip extension from the same fixed housing underside.
-# These bounds must cover the complete open-to-close stroke being used.
-FINGER_CLEARANCE_MM = _grasp_settings.finger_clearance_mm
-MAX_FINGER_EXTENSION_MM = _grasp_settings.max_finger_extension_mm
-GRIPPER_BODY_FROM_FLANGE_MM = _grasp_settings.gripper_body_from_flange_mm
-MEASURED_OBJECT_WIDTHS_MM = _grasp_settings.object_width_mm
-
-
-def require_grasp_calibration():
-    values = (FINGER_CLEARANCE_MM, MAX_FINGER_EXTENSION_MM, GRIPPER_BODY_FROM_FLANGE_MM)
-    if any(v is None for v in values):
-        flags = ("--finger-clearance-mm", "--max-finger-extension-mm", "--gripper-body-from-flange-mm")
-        missing = ", ".join(flag for flag, value in zip(flags, values) if value is None)
-        raise ValueError(f"Missing measured gripper geometry: {missing}. "
-                         "Finger measurements run from the housing underside to the finger ends, "
-                         "not between the jaws. Supply the missing values before picking.")
-    if (not all(math.isfinite(v) for v in values)
-            or FINGER_CLEARANCE_MM <= GRIPPER_BODY_CLEARANCE_MM
-            or MAX_FINGER_EXTENSION_MM < FINGER_CLEARANCE_MM
-            or GRIPPER_BODY_FROM_FLANGE_MM <= 0):
-        raise ValueError("Invalid measured gripper geometry")
+GRASP_Z_OFFSET_MM = 0.0              # + raises the grasp (fingertips land at object center + this)
 
 # Orientation: grasp with the wrist orientation the arm already has at the
 # observe pose when it points roughly down, so the planner never has to spin
@@ -227,21 +137,13 @@ MIN_DOWNWARD_O_Z = -0.9              # current orientation reused only if o_z <=
 ORIENTATION_TOLERANCE_DEGS = 15.0    # held along approach and carry moves
 LINE_TOLERANCE_MM = 10.0             # descent / lift stay on a straight line
 
-# Position-limited close: the uFactory gripper takes a
+# Width-based close (so a paper cup isn't crushed): the uFactory gripper takes a
 # position on a 0-850 scale (850 = fully open, ~85 mm), i.e. ~10 units per mm.
-# This bounds requested closure; it is not force control or a crush guarantee.
-GRIPPER_SQUEEZE_MM = 1.0
+GRIPPER_SQUEEZE_MM = 8.0
 GRIPPER_POS_PER_MM = 10.0
 GRIPPER_MAX_POS = 850
-GRIPPER_OPEN_MIN_POS = 830
-GRIPPER_CLOSED_MAX_POS = 10
-GRIPPER_MIN_CLOSURE_POS = 10
-GRIPPER_POSITION_TOLERANCE = 6
-GRIPPER_VERIFY_TIMEOUT_S = 3.0
-GRIPPER_MAX_WIDTH_ERROR_MM = 5.0
-# Close all the way and let the object stop the jaws (the gripper's own force
-# limit holds it). Fully closed jaws still mean "nothing grabbed".
-# False = the older close to the estimated width.
+# Close fully and let the object stop the jaws. This is the merged behavior
+# from the contributor's "gripper close fully" change.
 GRIPPER_CLOSE_FULLY = True
 GRIPPER_FULL_CLOSE_POS = 0
 
@@ -249,9 +151,7 @@ GRIPPER_FULL_CLOSE_POS = 0
 # (python main.py --set-home -> home_pose.json). Without it, the object is
 # carried back to where the gripper was when the object was locked.
 HOME_POSE_PATH = HERE / "home_pose.json"
-# The saved pose is primarily a return destination after picking/dropping.
-# Moving there at launch requires an explicit flag.
-GO_HOME_ON_START = "--go-home-on-start" in sys.argv
+GO_HOME_ON_START = True
 RETURN_TO_START = True
 
 # Every other segmented object is frozen into world coordinates at lock time
@@ -259,8 +159,10 @@ RETURN_TO_START = True
 # table/wall/ceiling obstacles. Direct arm moves ignore obstacles, so this
 # code only ever moves through the motion service.
 AVOID_DETECTED_OBJECTS = True
+RETRY_WITHOUT_OBSTACLES = True       # retry once with only the static obstacles (constraints kept)
 
 WEBCAM_INDEX = 0
+RELEASE_AFTER_SECONDS = 4.0
 WINDOW = "Gaze-selected pick (Q stop+quit, R release lock, C recalibrate)"
 
 EXECUTE = "--execute" in sys.argv
@@ -489,69 +391,6 @@ def object_label(point_cloud_obj) -> str:
     return ""
 
 
-TOP_FACE_BAND_MM = 12.0       # points this close below the highest ones count as the object's top face
-TOP_FACE_MAX_SHIFT_MM = 30.0  # the top-face center may differ this much from the segmenter's center
-
-
-def parse_pcd_xyz(data: bytes) -> np.ndarray:
-    """XYZ in mm (N x 3) from a binary PCD, the format Viam returns point clouds in."""
-    head, sep, body = data.partition(b"DATA binary\n")
-    if not sep:
-        raise ValueError("unsupported point cloud encoding (expected binary PCD)")
-    fields = {}
-    for line in head.decode("ascii", "replace").splitlines():
-        parts = line.split()
-        if parts:
-            fields[parts[0].upper()] = parts[1:]
-    names, sizes = fields["FIELDS"], [int(v) for v in fields["SIZE"]]
-    counts = [int(v) for v in fields.get("COUNT", ["1"] * len(names))]
-    n = int(fields["POINTS"][0])
-    stride = sum(size * count for size, count in zip(sizes, counts))
-    raw = np.frombuffer(body, dtype=np.uint8, count=n * stride).reshape(n, stride)
-    cols, offset = {}, 0
-    for name, size, count in zip(names, sizes, counts):
-        if name in ("x", "y", "z"):
-            cols[name] = raw[:, offset:offset + size].copy().view({4: "<f4", 8: "<f8"}[size]).ravel()
-        offset += size * count
-    xyz = np.stack([cols["x"], cols["y"], cols["z"]], axis=1).astype(float)
-    xyz = xyz[np.isfinite(xyz).all(axis=1) & (np.abs(xyz).sum(axis=1) > 0)]
-    if len(xyz) and np.median(np.abs(xyz[:, 2])) < 20.0:   # Viam point clouds are in metres
-        xyz *= 1000.0
-    return xyz
-
-
-async def frame_to_world(robot: RobotClient, ref: str) -> tuple[np.ndarray, np.ndarray]:
-    """(origin, R) such that world = origin + R @ p for a point p in `ref`, as the
-    frames are right now (so call it while the arm is still)."""
-    async def world(x, y, z):
-        p = await pose_in(robot, Pose(x=x, y=y, z=z, o_z=1.0), ref, MOTION_REFERENCE_FRAME)
-        return np.array([p.x, p.y, p.z])
-    origin = await world(0.0, 0.0, 0.0)
-    axes = [await world(*e) - origin for e in ((1000.0, 0.0, 0.0), (0.0, 1000.0, 0.0), (0.0, 0.0, 1000.0))]
-    return origin, np.stack(axes, axis=1) / 1000.0
-
-
-def object_top_face(point_cloud_obj, to_world) -> Optional[tuple[float, float, float]]:
-    """(x, y, top z) of the object's top face in world, from its own depth points.
-    The segmenter's box center is the MEAN of the points, which the dense top
-    face pulls upward, so center + height/2 overshoots the real top (by ~13 mm
-    on a 60 mm block on this machine) and the fingers barely reach the object."""
-    try:
-        points = parse_pcd_xyz(point_cloud_obj.point_cloud)
-    except Exception as e:
-        print(f"[grab] couldn't read the object's depth points ({type(e).__name__}: {e})")
-        return None
-    if len(points) < 30:
-        return None
-    origin, rotation = to_world
-    world = points @ rotation.T + origin
-    top = float(np.percentile(world[:, 2], 98))          # robust to a few stray points
-    face = world[world[:, 2] >= top - TOP_FACE_BAND_MM]
-    if len(face) < 20:
-        return None
-    return float(np.median(face[:, 0])), float(np.median(face[:, 1])), top
-
-
 def object_reference_frame(point_cloud_obj, default: str = CAMERA_NAME) -> str:
     """The segmenter says which frame its geometries are in ('cam' on this
     machine). Trust it: labeling camera-frame numbers as world sends the arm
@@ -628,8 +467,7 @@ async def match_object_to_box(robot: RobotClient, objs, box: Box, intr: Optional
 async def obstacles_in_world(robot: RobotClient, objs, exclude) -> Optional[WorldState]:
     """Every other segmented object, frozen into WORLD coordinates now, while
     the arm is still. Left in the camera frame they would ride along with the
-    wrist camera once the arm moves. Planner names identify individual shapes;
-    semantic labels on the source detections remain unchanged."""
+    wrist camera once the arm moves."""
     if not AVOID_DETECTED_OBJECTS:
         return None
     geoms = []
@@ -641,9 +479,6 @@ async def obstacles_in_world(robot: RobotClient, objs, exclude) -> Optional[Worl
             ng = Geometry()
             ng.CopyFrom(g)
             ng.center.CopyFrom(await pose_in(robot, g.center, ref, MOTION_REFERENCE_FRAME))
-            # A class label such as "can" is not unique when several objects or
-            # duplicate detections are present. Viam requires unique names.
-            ng.label = f"gaze_detected_{len(geoms)}"
             geoms.append(ng)
     if not geoms:
         return None
@@ -651,24 +486,7 @@ async def obstacles_in_world(robot: RobotClient, objs, exclude) -> Optional[Worl
 
 
 def merge_world_states(*states: Optional[WorldState]) -> Optional[WorldState]:
-    """Copy obstacle frames and give every merged shape a unique planner name.
-
-    Captures and retained object footprints may each start numbering at zero.
-    Reassign names across the full request, including a single input state,
-    without changing the stored states used by later actions.
-    """
-    obstacles = []
-    geometry_index = 0
-    for state in states:
-        if state is None:
-            continue
-        for frame in state.obstacles:
-            copied_frame = GeometriesInFrame()
-            copied_frame.CopyFrom(frame)
-            for geometry in copied_frame.geometries:
-                geometry.label = f"gaze_obstacle_{geometry_index}"
-                geometry_index += 1
-            obstacles.append(copied_frame)
+    obstacles = [gif for s in states if s is not None for gif in s.obstacles]
     return WorldState(obstacles=obstacles) if obstacles else None
 
 
@@ -705,53 +523,6 @@ class GraspPlan:
     return_pose: Optional[Pose]
     width_mm: float
     fingertip_beyond_tcp_mm: float
-    object_top_z_mm: float
-    fingertip_z_mm: float
-    body_clearance_mm: float
-    lowest_fingertip_z_mm: float
-    body_z_mm: float
-
-
-def pose_rotation(pose: Pose) -> np.ndarray:
-    """Use Viam's orientation-vector convention, not an axis-angle formula."""
-    if not all(math.isfinite(v) for v in (pose.o_x, pose.o_y, pose.o_z, pose.theta)):
-        raise ValueError("Invalid object orientation")
-    if math.hypot(pose.o_x, pose.o_y, pose.o_z) < 1e-9:
-        return np.eye(3)
-    return np.asarray(Quaternion.from_pose(pose).to_rotation_matrix().elements).reshape(3, 3)
-
-
-def world_box_extents(world_center: Pose, size) -> np.ndarray:
-    dims = np.asarray(size, dtype=float)
-    if dims.shape != (3,) or not np.all(np.isfinite(dims)) or np.any(dims <= 0):
-        raise ValueError("No usable 3D object dimensions; refusing to guess the object's top")
-    # Box dimensions are measured along its local axes. After a camera->world
-    # transform, camera depth is generally NOT the object's vertical height.
-    return np.abs(pose_rotation(world_center)) @ dims
-
-
-def pose_error(actual: Pose, expected: Pose) -> tuple[float, float]:
-    coordinates = (actual.x, actual.y, actual.z, expected.x, expected.y, expected.z)
-    if not all(math.isfinite(value) for value in coordinates):
-        raise ValueError("Nonfinite robot pose")
-    distance = math.dist(coordinates[:3], coordinates[3:])
-    rotation = pose_rotation(actual).T @ pose_rotation(expected)
-    angle = math.degrees(math.acos(float(np.clip((np.trace(rotation) - 1) / 2, -1, 1))))
-    return distance, angle
-
-
-def target_repeat_problem(first: Pose, first_size, second: Pose, second_size) -> Optional[str]:
-    """A stationary target must agree across two independent depth captures."""
-    distance = math.dist((first.x, first.y, first.z), (second.x, second.y, second.z))
-    a, b = world_box_extents(first, first_size), world_box_extents(second, second_size)
-    change = float(np.max(np.abs(a - b)))
-    top_change = abs(first.z + a[2] / 2 - second.z - b[2] / 2)
-    if (not math.isfinite(distance) or distance > TARGET_REPEAT_POSITION_MM
-            or change > TARGET_REPEAT_SIZE_MM or top_change > TARGET_REPEAT_POSITION_MM):
-        return (f"depth captures disagree: center changed {distance:.1f} mm, "
-                f"dimensions {change:.1f} mm, top {top_change:.1f} mm; "
-                "check the depth image/camera frame before retrying")
-    return None
 
 
 def grasp_orientation(current: Optional[Pose]) -> dict:
@@ -761,65 +532,22 @@ def grasp_orientation(current: Optional[Pose]) -> dict:
 
 
 def plan_grasp(w: Pose, size, current: Optional[Pose], tcp_mm: float,
-               home: Optional[Pose], top_z: Optional[float] = None,
-               table_z: Optional[float] = None) -> GraspPlan:
-    """Use the world top of the object and keep the palm above it.
-    top_z: the object's measured top (from its depth points); table_z: the
-    table as the depth camera sees it (run_grasp passes MEASURED_TABLE_TOP_Z_MM).
-    The floor uses the HIGHER of that and the configured table, so the
-    fingertips never go below either."""
-    require_grasp_calibration()
-    if not all(math.isfinite(v) for v in (w.x, w.y, w.z, tcp_mm, FINGER_CLEARANCE_MM, GRASP_Z_OFFSET_MM)):
-        raise ValueError("Invalid grasp geometry")
-    if tcp_mm <= 0:
-        raise ValueError("Invalid TCP reference offset")
-    if current is None or not all(math.isfinite(v) for v in (
-            current.x, current.y, current.z, current.o_x, current.o_y, current.o_z, current.theta)):
-        raise ValueError("A valid current gripper pose is required before descent")
-    if GRASP_Z_OFFSET_MM < 0 or FINGER_CLEARANCE_MM <= GRIPPER_BODY_CLEARANCE_MM:
-        raise ValueError("Invalid upward offset or measured finger clearance")
-    if current.o_z > MIN_DOWNWARD_O_Z:
-        raise ValueError("Park the gripper pointing vertically down before picking")
+               home: Optional[Pose]) -> GraspPlan:
+    """Poses in world. The TCP stops so the fingertips land at the object's
+    center height (never closer than the clearance to the table)."""
     orient = grasp_orientation(current)
-    norm = math.hypot(orient["o_x"], orient["o_y"], orient["o_z"])
-    down = -orient["o_z"] / norm
-    if down < math.cos(math.radians(5)):
-        raise ValueError("Park the gripper pointing vertically down (within 5 degrees) before picking")
-    extents = world_box_extents(w, size)
-    top = top_z if top_z is not None else w.z + extents[2] / 2.0
-    table = TABLE_TOP_Z_MM if table_z is None else max(TABLE_TOP_Z_MM, table_z)
-    # Allow for the low edge of a slightly tilted body, using a conservative
-    # 100 mm radius around the tool axis. This is separate from finger length.
-    tilt_margin = 100.0 * math.sqrt(max(0.0, 1.0 - down * down))
-    stroke_height = (MAX_FINGER_EXTENSION_MM - FINGER_CLEARANCE_MM) * down
-    # Position the RIGID housing. A closing linkage may lift the object before
-    # the arm lifts, so reserve the full axial stroke above its observed top.
-    body_z = max(
-        top + FINGER_CLEARANCE_MM * down - tilt_margin - FINGER_INSERTION_MM,
-        top + GRIPPER_BODY_CLEARANCE_MM + tilt_margin + stroke_height,
-        table + FINGERTIP_TABLE_CLEARANCE_MM + MAX_FINGER_EXTENSION_MM * down + tilt_margin,
-    ) + GRASP_Z_OFFSET_MM
-    tip_z = body_z - FINGER_CLEARANCE_MM * down + tilt_margin
-    lowest_tip_z = body_z - MAX_FINGER_EXTENSION_MM * down - tilt_margin
-    if tip_z >= top:
-        raise ValueError("The upward offset/table clearance leaves the fingertips above the object; "
-                         "refusing a grasp with no finger overlap")
-    body_from_tcp = GRIPPER_BODY_FROM_FLANGE_MM - tcp_mm
-    z = body_z + body_from_tcp * down
-    x, y = w.x - body_from_tcp * orient["o_x"] / norm, w.y - body_from_tcp * orient["o_y"] / norm
-    grasp = Pose(x=x, y=y, z=z, **orient)
-    approach = Pose(x=x, y=y, z=z + APPROACH_HEIGHT_MM, **orient)
+    beyond = max(0.0, FINGERTIP_FROM_FLANGE_MM - tcp_mm)
+    z = w.z + beyond + GRASP_Z_OFFSET_MM
+    z = max(z, TABLE_TOP_Z_MM + FINGERTIP_TABLE_CLEARANCE_MM + beyond)
+    grasp = Pose(x=w.x, y=w.y, z=z, **orient)
+    approach = Pose(x=w.x, y=w.y, z=z + APPROACH_HEIGHT_MM, **orient)
     back = None
     if RETURN_TO_START:
         src = home or current
         if src is not None:
             back = Pose(x=src.x, y=src.y, z=src.z, **orient)   # carried back level, same wrist
-    # Existing width estimate remains approximate: it is not force feedback.
-    # The close verifier rejects implausible gaps and unconfirmed contact.
     width = min((d for d in size[:2] if d > 0), default=0.0)
-    beyond = GRIPPER_BODY_FROM_FLANGE_MM + MAX_FINGER_EXTENSION_MM - tcp_mm
-    return GraspPlan(orient, approach, grasp, back, width, beyond, top, tip_z,
-                     body_z - tilt_margin - top - stroke_height, lowest_tip_z, body_z)
+    return GraspPlan(orient, approach, grasp, back, width, beyond)
 
 
 # --------------------------------------------------------------------------- motion
@@ -836,10 +564,6 @@ class GraspJob:
         self.ok = False                       # the whole job succeeded
         self.motion_started = False
         self.connection_error: Optional[Exception] = None
-        self.requires_operator = False
-        self.action_error: Optional[Exception] = None
-        self.plan_rejection: Optional[str] = None
-        self.motion_failure: Optional[str] = None
 
     @property
     def done(self) -> bool:
@@ -856,80 +580,34 @@ def straight_line() -> Constraints:
         LinearConstraint(line_tolerance_mm=LINE_TOLERANCE_MM, orientation_tolerance_degs=ORIENTATION_TOLERANCE_DEGS)])
 
 
-def is_ik_constraint_rejection(error: Exception) -> bool:
-    """Recognize the specific failure returned before motion execution starts."""
-    return (isinstance(error, GRPCError) and error.status == Status.UNKNOWN
-            and (error.message or "").lower().startswith("all ik solutions failed constraints."))
-
-
-async def report_motion_wait(job, label: str, started: float) -> None:
-    """Report a pending RPC without assuming the robot has begun moving."""
-    while True:
-        await asyncio.sleep(MOTION_WAIT_REPORT_S)
-        elapsed = time.monotonic() - started
-        job.status = f"{label}: motion request pending {elapsed:.0f}s (planning/execution)"
-        print(f"[motion] {job.status}; movement not confirmed; Q stops", flush=True)
-
-
 async def move_to(motion: MotionClient, pose: Pose, label: str, job: GraspJob,
                   world_state: Optional[WorldState] = None,
                   constraints: Optional[Constraints] = None) -> bool:
-    if getattr(job, "plan_rejection", None) or getattr(job, "motion_failure", None):
-        # A failed stage ends this job. Existing cleanup paths may request a
-        # retreat, but no additional command is sent until a new job is chosen.
-        job.status = getattr(job, "plan_rejection", None) or job.motion_failure
-        return False
-    prefix = "DRY RUN, would be moving" if DRY_RUN else "requesting move"
+    prefix = "DRY RUN, would be " if DRY_RUN else ""
     extras = []
     if world_state is not None:
         extras.append(f"{sum(len(g.geometries) for g in world_state.obstacles)} obstacles")
     if constraints is not None:
         extras.append("straight line" if constraints.linear_constraint else "orientation held")
-    job.status = (f"{prefix} to {label}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} mm"
+    job.status = (f"{prefix}moving to {label}: x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} mm"
                   + (f" ({', '.join(extras)})" if extras else ""))
     print(f"[grab] {job.status}")
     if DRY_RUN:
         await asyncio.sleep(0.4)
         return True
     # viam-sdk 0.80.0: component_name is the component's plain name (proto string).
-    motion_started_before = getattr(job, "motion_started", False)
     job.motion_started = True
-    started = time.monotonic()
-    reporter = asyncio.create_task(report_motion_wait(job, label, started))
-    try:
-        ok = await motion.move(
-            component_name=GRIPPER_NAME,
-            destination=PoseInFrame(reference_frame=MOTION_REFERENCE_FRAME, pose=pose),
-            world_state=world_state,
-            constraints=constraints,
-        )
-    except asyncio.CancelledError:
-        print(f"[motion] {label}: request cancelled after {time.monotonic() - started:.1f}s", flush=True)
-        raise
-    except Exception as error:
-        print(f"[motion] {label}: request failed after {time.monotonic() - started:.1f}s: "
-              f"{type(error).__name__}: {error}", flush=True)
-        if not is_ik_constraint_rejection(error):
-            raise
-        # Viam plans before executing. This narrow error says this particular
-        # command never executed; earlier completed actions remain recorded.
-        job.motion_started = motion_started_before
-        job.plan_rejection = f"PLAN REJECTED at {label}: {error.message}"
-        job.status = job.plan_rejection
-        print(f"[grab] {job.status}")
-        return False
-    finally:
-        reporter.cancel()
-        await asyncio.gather(reporter, return_exceptions=True)
-    print(f"[motion] {label}: response success={ok} after {time.monotonic() - started:.1f}s", flush=True)
-    if ok:
-        job.status = f"Completed move to {label} (motion service reported success)"
+    ok = await motion.move(
+        component_name=GRIPPER_NAME,
+        destination=PoseInFrame(reference_frame=MOTION_REFERENCE_FRAME, pose=pose),
+        world_state=world_state,
+        constraints=constraints,
+    )
+    if not ok and world_state is not None and RETRY_WITHOUT_OBSTACLES:
+        print(f"[grab] planning to {label} failed with detected obstacles; retrying with static obstacles only")
+        return await move_to(motion, pose, label, job, None, constraints)
     if not ok:
         job.status = f"motion.move() failed on {label}"
-        # False does not establish whether the robot moved. Preserve the
-        # physical-action flag and block automatic follow-up commands.
-        job.motion_failure = job.status
-        job.requires_operator = True
         print(f"[grab] {job.status}")
     return ok
 
@@ -938,142 +616,66 @@ def gripper_position_for_width(width_mm: float) -> int:
     return int(max(0.0, min(GRIPPER_MAX_POS, (width_mm - GRIPPER_SQUEEZE_MM) * GRIPPER_POS_PER_MM)))
 
 
-def checked_gripper_position(response, key: str) -> float:
-    """A missing or malformed readback leaves the physical state unknown."""
-    value = response.get(key) if isinstance(response, dict) else None
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or not 0 <= value <= GRIPPER_MAX_POS):
-        raise RuntimeError(f"gripper returned no valid {key!r} position; stopping with grip unconfirmed")
-    return float(value)
-
-
-async def read_gripper_position(gripper: Gripper, timeout: float = 3.0) -> float:
-    response = await gripper.do_command({"get": True}, timeout=timeout)
-    return checked_gripper_position(response, "pos")
-
-
 async def open_gripper(gripper: Gripper, job: GraspJob) -> None:
     job.status = "DRY RUN, would open the gripper" if DRY_RUN else "opening the gripper"
     print(f"[grab] {job.status}")
     if not DRY_RUN:
         job.motion_started = True
-        job.holding = None
-        await gripper.open(timeout=CAPTURE_TIMEOUT_S)
-        # A successful RPC does not establish that the fingers actually opened.
-        # Keep the arm above the object until a fully open readback arrives.
-        async with asyncio.timeout(2.0):
-            while True:
-                position = await read_gripper_position(gripper, timeout=2.0)
-                moving = await gripper.is_moving(timeout=2.0)
-                if not moving and position >= GRIPPER_OPEN_MIN_POS:
-                    job.holding = False
-                    print(f"[grab] opening verified at position {position:.0f}")
-                    return
-                await asyncio.sleep(0.1)
+        await gripper.open()
+        await asyncio.sleep(0.3)   # let the fingers finish opening
 
 
-async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJob) -> bool:
-    """Close once to a bounded width and require position evidence of contact.
-
-    G1's holding boolean only means the jaws are between their endpoints. An
-    empty partial close therefore cannot be called a grasp. Even the checks
-    below are contact heuristics, not force sensing or proof of object retention.
-    """
-    job.holding = None
-
-    def unconfirmed(reason: str) -> bool:
-        job.holding = False
-        job.status = f"grip unconfirmed: {reason}"
-        print(f"[grab] {job.status}")
-        return False
-
+async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJob) -> None:
+    """Close to the object's width ({"set": pos} on the gripper, then the arm's
+    move_gripper); grab() by force feedback if that isn't accepted or the width
+    estimate is useless."""
     max_span_mm = GRIPPER_MAX_POS / GRIPPER_POS_PER_MM
-    if not math.isfinite(width_mm) or not 0 < width_mm <= max_span_mm:
-        return unconfirmed(f"estimated width {width_mm:g} mm is outside the usable gripper span")
-    target = GRIPPER_FULL_CLOSE_POS if GRIPPER_CLOSE_FULLY else gripper_position_for_width(width_mm)
     if DRY_RUN:
-        job.status = (f"DRY RUN, would close once to position {target} "
-                      f"(object ~{width_mm:.0f} mm wide) and verify contact")
+        target = GRIPPER_FULL_CLOSE_POS if GRIPPER_CLOSE_FULLY else gripper_position_for_width(width_mm)
+        job.status = (f"DRY RUN, would close the gripper to position {target} "
+                      f"(object ~{width_mm:.0f} mm wide)" if 0 < width_mm <= max_span_mm
+                      else "DRY RUN, would call grab()")
         print(f"[grab] {job.status}")
-        return True
-
-    before = await read_gripper_position(gripper, timeout=GRIPPER_VERIFY_TIMEOUT_S)
-    if before < GRIPPER_OPEN_MIN_POS:
-        return unconfirmed(f"gripper was not fully open before closing (position {before:.0f})")
-
+        return
     job.motion_started = True
-    job.status = f"object ~{width_mm:.0f} mm wide, closing once to position {target}"
-    print(f"[grab] {job.status}")
-    # A timeout may follow an executed command. Never replay through another
-    # API, and never replace this bounded move with an unrestricted grab().
-    response = await gripper.do_command({"set": target}, timeout=CAPTURE_TIMEOUT_S)
-    if isinstance(response, dict) and not response:
-        return unconfirmed("the driver did not acknowledge the width command")
-    checked_gripper_position(response, "position")
-
-    # Read measured positions after the acknowledgement. The driver's moving
-    # flag tracks its RPC, so also require the actual position to settle.
-    samples = []
-    async with asyncio.timeout(GRIPPER_VERIFY_TIMEOUT_S):
-        while True:
-            position = await read_gripper_position(gripper, timeout=GRIPPER_VERIFY_TIMEOUT_S)
-            moving = await gripper.is_moving(timeout=GRIPPER_VERIFY_TIMEOUT_S)
-            samples.append(position)
-            samples = samples[-3:]
-            if (not moving and len(samples) == 3
-                    and max(samples) - min(samples) <= GRIPPER_POSITION_TOLERANCE):
-                break
-            await asyncio.sleep(0.1)
-
-    if before - position < GRIPPER_MIN_CLOSURE_POS:
-        return unconfirmed(f"no measurable closure ({before:.0f} -> {position:.0f})")
-    if not GRIPPER_CLOSED_MAX_POS < position < GRIPPER_OPEN_MIN_POS:
-        return unconfirmed(f"jaws ended at an empty-gripper endpoint ({position:.0f})")
-    if position - target <= GRIPPER_POSITION_TOLERANCE:
-        return unconfirmed("jaws reached the requested width without evidence of object contact")
-    if position / GRIPPER_POS_PER_MM > width_mm + GRIPPER_MAX_WIDTH_ERROR_MM:
-        return unconfirmed("jaws stopped too far apart for the detected object's width")
-
-    status = await gripper.is_holding_something(timeout=GRIPPER_VERIFY_TIMEOUT_S)
-    holding = getattr(status, "is_holding_something", status)
-    if not isinstance(holding, bool):
-        raise RuntimeError("gripper returned an invalid holding status; stopping with grip unconfirmed")
-    if not holding:
-        return unconfirmed("the gripper reports no object after closing")
-
-    job.holding = True
-    job.status = f"contact inferred: jaws {before:.0f} -> {position:.0f}, target {target}"
-    print(f"[grab] {job.status}")
-    return True
-
-
-async def verify_grasp_arrival(motion: MotionClient, arm: Arm, pose: Pose, job: GraspJob) -> bool:
-    """Never close solely because the movement RPC returned success."""
-    if DRY_RUN:
-        return True
-    for sample in range(2):
-        moving = await arm.is_moving(timeout=GRIPPER_VERIFY_TIMEOUT_S)
-        actual = await gripper_world_pose(motion)
-        if actual is None:
-            raise RuntimeError("Could not verify the actual grasp pose; jaws have not been closed")
-        distance, angle = pose_error(actual, pose)
-        print(f"[grab] arrival readback {sample + 1}: TCP ({actual.x:.1f}, {actual.y:.1f}, "
-              f"{actual.z:.1f}); error {distance:.1f} mm / {angle:.2f} deg; moving={moving}")
-        if moving or distance > GRASP_ARRIVAL_POSITION_MM or angle > GRASP_ARRIVAL_ANGLE_DEG:
-            job.status = (f"NOT CLOSING: grasp pose not reached/stopped "
-                          f"({distance:.1f} mm, {angle:.1f} deg, moving={moving})")
-            print(f"[grab] {job.status}")
-            return False
-        if sample == 0:
-            await asyncio.sleep(0.15)
-    return True
+    if width_mm > max_span_mm:
+        job.status = f"estimated width {width_mm:.0f} mm exceeds the gripper's ~{max_span_mm:.0f} mm span; using grab()"
+        print(f"[grab] {job.status}")
+        await gripper.grab()
+        return
+    if width_mm > 0:
+        target = GRIPPER_FULL_CLOSE_POS if GRIPPER_CLOSE_FULLY else gripper_position_for_width(width_mm)
+        job.status = f"object ~{width_mm:.0f} mm wide, closing gripper to position {target}"
+        print(f"[grab] {job.status}")
+        attempts = (
+            (gripper, "gripper", {"set": target}),
+            (arm, "arm", {"setup_gripper": True, "move_gripper": target}),
+        )
+        for who, label, cmd in attempts:
+            try:
+                await who.do_command(cmd)
+                await asyncio.sleep(0.3)
+                return
+            except Exception as e:
+                if (is_transport_error(e) or isinstance(e, TimeoutError)
+                        or (isinstance(e, GRPCError) and e.status in (Status.DEADLINE_EXCEEDED, Status.CANCELLED))):
+                    # The command may have reached the gripper before its
+                    # response was lost; do not issue a different close command.
+                    raise
+                print(f"[grab] {cmd} on {label} not accepted ({type(e).__name__}: {e})")
+        print("[grab] width-based close unavailable; using grab()")
+    else:
+        job.status = "no size estimate, using grab()"
+        print(f"[grab] {job.status}")
+    await gripper.grab()
+    await asyncio.sleep(0.3)
 
 
 async def execute_grasp(motion: MotionClient, gripper: Gripper, arm: Arm, plan: GraspPlan,
                         obstacles: Optional[WorldState], job: GraspJob) -> bool:
     """Approach above (wrist held) -> open -> straight down -> close -> straight
     up, then hover there holding it: what happens next is the user's choice
-    (delivery.py). An unconfirmed grasp opens at the table and retreats. In a dry run every step
+    (delivery.py). A missed grasp opens and goes home. In a dry run every step
     is printed, nothing moves, and it continues as if holding."""
     if not await move_to(motion, plan.approach, "approach", job, obstacles, upright()):
         return False
@@ -1081,92 +683,27 @@ async def execute_grasp(motion: MotionClient, gripper: Gripper, arm: Arm, plan: 
     if not await move_to(motion, plan.grasp, "grasp (straight down)", job, obstacles, straight_line()):
         await move_to(motion, plan.approach, "back up", job, obstacles, straight_line())
         return False
-    if not await verify_grasp_arrival(motion, arm, plan.grasp, job):
-        return False
-    if not await close_gripper(gripper, arm, plan.width_mm, job):
-        reason = job.status
-        # Release at the table before retreating. Do not lift/carry an object
-        # on the strength of a position-only HoldingStatus.
-        await open_gripper(gripper, job)
-        await move_to(motion, plan.approach, "retreat after unconfirmed grip", job, obstacles, straight_line())
-        job.status = f"pickup NOT confirmed: {reason}"
+    await close_gripper(gripper, arm, plan.width_mm, job)
+
+    if not DRY_RUN:
+        # is_holding_something() returns a HoldingStatus (truthy even when False).
+        status = await gripper.is_holding_something()
+        job.holding = bool(getattr(status, "is_holding_something", status))
+        print(f"[grab] holding_something={job.holding} "
+              f"(gripper position={getattr(status, 'meta', {}).get('position', '?')})")
+
+    await move_to(motion, plan.approach, "lift (straight up)", job, obstacles, straight_line())
+
+    if not DRY_RUN and not job.holding:
+        await gripper.open()
+        if plan.return_pose is not None:
+            await move_to(motion, plan.return_pose, "home", job, obstacles, upright())
+        job.status = "missed: nothing in the gripper. Look at the object again to retry"
         print(f"[grab] {job.status}")
         return False
 
-    if not await move_to(motion, plan.approach, "lift (straight up)", job, obstacles, straight_line()):
-        job.status = "grip confirmed, but lift failed; object may still be held"
-        return False
     job.status = "DRY RUN: holding (pretend)" if DRY_RUN else "holding it"
     print(f"[grab] {job.status}")
-    return True
-
-
-def released_footprint(held: Held, release: Pose) -> Optional[WorldState]:
-    """Keep the released object in the world model for the return across the table."""
-    if held.footprint is None:
-        return None
-    footprint = WorldState()
-    footprint.CopyFrom(held.footprint)
-    delta = (release.x - held.pick_grasp.x, release.y - held.pick_grasp.y,
-             release.z - held.pick_grasp.z)
-    for frame in footprint.obstacles:
-        if frame.reference_frame != MOTION_REFERENCE_FRAME:
-            raise ValueError("Released-object footprint must already be in world coordinates")
-        for geometry in frame.geometries:
-            geometry.center.x += delta[0]
-            geometry.center.y += delta[1]
-            geometry.center.z += delta[2]
-            if release.z > held.place_z + 10.0:
-                # "Let go" can release above the table. Enclose the vertical
-                # drop as well as the release position instead of leaving a
-                # floating obstacle at the old wrist height.
-                kind = geometry.WhichOneof("geometry_type")
-                if kind == "box":
-                    dims = geometry.box.dims_mm
-                    extents = world_box_extents(geometry.center, (dims.x, dims.y, dims.z))
-                elif kind == "sphere":
-                    extents = np.full(3, 2.0 * geometry.sphere.radius_mm)
-                else:
-                    raise ValueError("Cannot bound the released object's drop; return paused")
-                low = min(TABLE_TOP_Z_MM, geometry.center.z - extents[2] / 2.0)
-                high = geometry.center.z + extents[2] / 2.0
-                geometry.center.CopyFrom(Pose(x=geometry.center.x, y=geometry.center.y,
-                                              z=(low + high) / 2.0, o_z=1.0))
-                geometry.box.dims_mm.x = float(extents[0])
-                geometry.box.dims_mm.y = float(extents[1])
-                geometry.box.dims_mm.z = float(high - low)
-    return footprint
-
-
-async def return_after_release(motion: MotionClient, held: Held, job) -> bool:
-    """After verified opening, rise at the actual drop XY, then return home."""
-    release = held.pose if DRY_RUN else await gripper_world_pose(motion)
-    if release is None:
-        raise RuntimeError("Object released, but the actual wrist pose is unknown; return paused")
-    home = held.home or Pose(x=held.pick_approach.x, y=held.pick_approach.y,
-                             z=max(held.pick_approach.z, TABLE_TOP_Z_MM + DEFAULT_RETURN_HEIGHT_ABOVE_TABLE_MM),
-                             **held.orientation)
-    if not all(math.isfinite(value) for p in (release, home)
-               for value in (p.x, p.y, p.z, p.o_x, p.o_y, p.o_z, p.theta)):
-        raise ValueError("Invalid return/drop pose; no return movement sent")
-    # Keep the current orientation while the fingertips clear the released
-    # object. The horizontal return happens only after this ascent succeeds.
-    up = Pose(x=release.x, y=release.y, z=max(home.z, release.z + MIN_RELEASE_RETREAT_MM),
-              o_x=release.o_x, o_y=release.o_y, o_z=release.o_z, theta=release.theta)
-    held.pose = release
-    print(f"[grab] object released; vertical retreat at ({release.x:.1f}, {release.y:.1f}) "
-          f"to z={up.z:.1f}, then saved return ({home.x:.1f}, {home.y:.1f}, {home.z:.1f}) mm")
-    if not await move_to(motion, up, "rise vertically after release", job, held.obstacles, straight_line()):
-        job.status = "Object released, but vertical retreat failed; return paused"
-        job.requires_operator = True
-        return False
-    held.pose = up
-    obstacles = merge_world_states(held.obstacles, released_footprint(held, release))
-    if not await move_to(motion, home, "the saved return pose after release", job, obstacles, upright()):
-        job.status = "Object released, but couldn't return to the saved pose"
-        job.requires_operator = True
-        return False
-    held.pose = home
     return True
 
 
@@ -1174,23 +711,19 @@ async def put_back(motion: MotionClient, gripper: Gripper, held: Held,
                    obstacles: Optional[WorldState], job: GraspJob) -> bool:
     """Set the held object down where it was picked up: above -> straight down
     -> open -> straight up. The gripper opens only once the descent succeeded,
-    so a failed plan never drops it. True once released and the retreat succeeds."""
-    # During a swap this is the newer scene, including the next pick target.
-    # Keep it for the complete placement and return, including recovery.
-    held.obstacles = obstacles
+    so a failed plan never drops it. True once it's released."""
     g = held.pick_grasp
     above = Pose(x=g.x, y=g.y, z=held.pick_approach.z, **held.orientation)
     place = Pose(x=g.x, y=g.y, z=held.place_z, **held.orientation)
     if not await move_to(motion, above, f"above where the {held.label} was", job, obstacles, upright()):
         return False
-    held.pose = above
     if not await move_to(motion, place, f"put the {held.label} down", job, obstacles, straight_line()):
         await move_to(motion, above, "back up", job, obstacles, straight_line())
         return False
-    held.pose = place
     await open_gripper(gripper, job)
     job.held = None                       # released: from here on the gripper is empty
-    return await return_after_release(motion, held, job)
+    await move_to(motion, above, "lift (straight up)", job, obstacles, straight_line())
+    return True
 
 
 async def run_put_back(motion: MotionClient, gripper: Gripper, held: Held, job: GraspJob) -> bool:
@@ -1198,10 +731,12 @@ async def run_put_back(motion: MotionClient, gripper: Gripper, held: Held, job: 
     job.held = held
     try:
         if not await put_back(motion, gripper, held, held.obstacles, job):
-            state = "still holding it" if job.held is not None else f"released it; {job.status}"
-            job.status = f"couldn't finish putting the {held.label} back; {state}"
+            job.status = f"couldn't put the {held.label} back; still holding it"
             print(f"[grab] {job.status}")
             return False
+        if held.home is not None:
+            await move_to(motion, held.home, "the observe pose", job,
+                          merge_world_states(held.obstacles, held.footprint), upright())
         job.ok = True
         job.status = f"put the {held.label} back"
         print(f"[grab] {job.status}")
@@ -1210,11 +745,8 @@ async def run_put_back(motion: MotionClient, gripper: Gripper, held: Held, job: 
         job.status = "cancelled"
         raise
     except Exception as e:
-        job.action_error = e
         if is_transport_error(e):
             job.connection_error = e
-        if job.motion_started:
-            job.requires_operator = True
         job.status = f"error: {e}"
         print(f"[grab] {job.status}")
         return False
@@ -1275,10 +807,6 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         # Everything that depends on where the wrist camera is happens now,
         # before anything moves.
         current = await gripper_world_pose(motion)
-        if current is None or await arm.is_moving(timeout=GRIPPER_VERIFY_TIMEOUT_S):
-            job.status = "NOT MOVING: the wrist must be stationary before measuring the target"
-            print(f"[grab] {job.status}")
-            return False
         objs = await capture_objects(segmenter)
         in_hand = await objects_in_gripper(robot, objs, current)
         target = await match_object_to_box(robot, objs, box, intr, frame_w, frame_h)
@@ -1293,8 +821,7 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
             return False
         center, size = object_center_and_size(target)
         ref = object_reference_frame(target)
-        # Preserve the box orientation so its world vertical extent is correct.
-        w = await pose_in(robot, center, ref, MOTION_REFERENCE_FRAME)
+        w = await pose_in(robot, Pose(x=center.x, y=center.y, z=center.z, o_z=1.0), ref, MOTION_REFERENCE_FRAME)
         print(f"[grab] target '{object_label(target)}' center ({center.x:.0f}, {center.y:.0f}, {center.z:.0f}) "
               f"in '{ref}' -> ({w.x:.0f}, {w.y:.0f}, {w.z:.0f}) in '{MOTION_REFERENCE_FRAME}', "
               f"size {size[0]:.0f}x{size[1]:.0f}x{size[2]:.0f} mm")
@@ -1303,109 +830,31 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
             job.status = f"NOT MOVING: {problem}"
             print(f"[grab] {job.status}")
             return False
-        # A stale depth result following manual wrist adjustment can otherwise
-        # acquire a plausible but completely wrong world height. Require a
-        # second independent capture while the wrist remains stationary.
-        await asyncio.sleep(0.3)
-        repeated = await capture_objects(segmenter)
-        repeated_target = await match_object_to_box(robot, repeated, box, intr, frame_w, frame_h)
-        if repeated_target is None:
-            job.status = "NOT MOVING: target missing from the second depth capture"
-            print(f"[grab] {job.status}")
-            return False
-        repeated_center, repeated_size = object_center_and_size(repeated_target)
-        repeated_world = await pose_in(robot, repeated_center,
-                                       object_reference_frame(repeated_target), MOTION_REFERENCE_FRAME)
-        after = await gripper_world_pose(motion)
-        if after is None:
-            raise RuntimeError("Cannot verify that the wrist stayed still during target capture")
-        distance, angle = pose_error(after, current)
-        problem = target_repeat_problem(w, size, repeated_world, repeated_size)
-        if object_label(target) != object_label(repeated_target):
-            problem = "the second depth capture matched a different object label"
-        if distance > 2.0 or angle > 1.0 or await arm.is_moving(timeout=GRIPPER_VERIFY_TIMEOUT_S):
-            problem = "wrist moved during depth capture; release the lock and select a fresh image"
-        if problem:
-            job.status = f"NOT MOVING: {problem}"
-            print(f"[grab] {job.status}")
-            return False
-        print(f"[grab] repeated depth agrees: target world z={w.z:.1f} / {repeated_world.z:.1f} mm")
-        # Use the more recent geometry after checking agreement.
-        target, objs, w, size = repeated_target, repeated, repeated_world, repeated_size
-        problem = target_problem(w)
-        if problem:
-            job.status = f"NOT MOVING: {problem}"
-            print(f"[grab] {job.status}")
-            return False
-        in_hand = await objects_in_gripper(robot, objs, after)
-        if any(target is o for o in in_hand):
-            job.status = "NOT MOVING: the repeated target is already at the gripper"
-            print(f"[grab] {job.status}")
-            return False
-        objs = [o for o in objs if not any(o is h for h in in_hand)]
         obstacles = await obstacles_in_world(robot, objs, target)
         footprint = await obstacles_in_world(robot, [target], None)   # the target itself, also frozen now
         n = sum(len(g.geometries) for g in obstacles.obstacles) if obstacles else 0
-        # The top face from the object's own depth points (they came with the
-        # segmentation; the frames are read now, while the arm is still).
-        face = object_top_face(target, await frame_to_world(robot, object_reference_frame(target)))
-        top_z = None
-        if face is not None:
-            fx, fy, top_z = face
-            box_top = w.z + world_box_extents(w, size)[2] / 2.0
-            if math.hypot(fx - w.x, fy - w.y) <= TOP_FACE_MAX_SHIFT_MM:
-                w = Pose(x=fx, y=fy, z=w.z, o_x=w.o_x, o_y=w.o_y, o_z=w.o_z, theta=w.theta)
-            print(f"[grab] top face from depth points: z={top_z:.1f} at ({fx:.0f}, {fy:.0f}) "
-                  f"(segmenter box said top z={box_top:.1f})")
-        plan = plan_grasp(w, size, current, tcp_mm, home, top_z=top_z, table_z=MEASURED_TABLE_TOP_Z_MM)
-        measured_width = MEASURED_OBJECT_WIDTHS_MM.get((object_label(target) or box.label).lower())
-        if measured_width is not None:
-            print(f"[grab] using operator-measured width {measured_width:.1f} mm for "
-                  f"'{object_label(target) or box.label}' (depth-box estimate {plan.width_mm:.1f} mm)")
-            plan.width_mm = measured_width
-        print(f"[grab] object top z={plan.object_top_z_mm:.1f}; fingertip z range="
-              f"{plan.lowest_fingertip_z_mm:.1f}..{plan.fingertip_z_mm:.1f}; body z={plan.body_z_mm:.1f}; "
-              f"TCP z={plan.grasp.z:.1f}; body clearance after possible jaw retraction="
-              f"{plan.body_clearance_mm:.1f} mm; "
-              f"extra upward offset={GRASP_Z_OFFSET_MM:.1f} mm")
-        if not (0 < plan.width_mm <= GRIPPER_MAX_POS / GRIPPER_POS_PER_MM):
-            job.status = f"NOT MOVING: estimated grasp width {plan.width_mm:.1f} mm is outside the gripper opening"
-            print(f"[grab] {job.status}")
-            return False
-        print(f"[grab] {n} other object(s) as obstacles; maximum fingertip offset "
-              f"{plan.fingertip_beyond_tcp_mm:.0f} mm from the TCP; "
-              f"wrist o=({plan.orientation['o_x']:.2f}, {plan.orientation['o_y']:.2f}, "
+        plan = plan_grasp(w, size, current, tcp_mm, home)
+        print(f"[grab] {n} other object(s) as obstacles; fingertips {plan.fingertip_beyond_tcp_mm:.0f} mm "
+              f"beyond the TCP; wrist o=({plan.orientation['o_x']:.2f}, {plan.orientation['o_y']:.2f}, "
               f"{plan.orientation['o_z']:.2f}) theta={plan.orientation['theta']:.1f}")
-        model = await load_grasp_model(robot, gripper, world_frame=MOTION_REFERENCE_FRAME)
-        if abs(model.table_top_z_mm - TABLE_TOP_Z_MM) > 1.0:
-            raise ValueError(f"Configured table top {model.table_top_z_mm:.1f} mm differs from "
-                             f"the grasp calculation's {TABLE_TOP_Z_MM:.1f} mm; update calibration first")
-        clearance = check_model_clearance(model, plan.grasp)
-        print(f"[grab] live collision model '{clearance.limiting_geometry}' table gap "
-              f"{clearance.clearance_mm:.1f} mm; minimum modeled TCP z={clearance.required_tcp_z_mm:.1f} mm")
         if held is not None:
             # Swap: put the held object back first, avoiding everything on the
             # table (the new target included); afterwards its spot is occupied
             # again, so the new grasp avoids it too.
             print(f"[grab] swap: putting the {held.label} back before picking the {object_label(target) or box.label}")
             if not await put_back(motion, gripper, held, merge_world_states(obstacles, footprint), job):
-                job.status = (f"couldn't finish putting the {held.label} back; "
-                              + ("still holding it" if job.held is not None else "object released")
-                              + ", nothing else picked")
+                job.status = f"couldn't put the {held.label} back; still holding it, nothing else picked"
                 print(f"[grab] {job.status}")
                 return False
             obstacles = merge_world_states(obstacles, held.footprint)
-        picked = await execute_grasp(motion, gripper, arm, plan, obstacles, job)
-        if not picked and not job.holding:
+        if not await execute_grasp(motion, gripper, arm, plan, obstacles, job):
             return False
         # The object was resting on the table, so setting it down anywhere on
         # the table means putting the TCP back at the grasp height.
         job.held = Held(label=object_label(target) or box.label, pick_grasp=plan.grasp,
                         pick_approach=plan.approach, orientation=plan.orientation, obstacles=obstacles,
                         place_z=plan.grasp.z + PLACE_CLEARANCE_MM, width_mm=plan.width_mm,
-                        pose=plan.approach if picked else plan.grasp, home=plan.return_pose, footprint=footprint)
-        if not picked:
-            return False
+                        pose=plan.approach, home=plan.return_pose, footprint=footprint)
         if carry_back and plan.return_pose is not None:
             if await move_to(motion, plan.return_pose, "the observe pose (holding it)", job, obstacles, upright()):
                 job.held.pose = plan.return_pose
@@ -1421,11 +870,8 @@ async def run_grasp(robot: RobotClient, intr: Optional[Intrinsics], frame_w: int
         job.status = "cancelled"
         raise
     except Exception as e:
-        job.action_error = e
         if is_transport_error(e):
             job.connection_error = e
-        if job.motion_started:
-            job.requires_operator = True
         job.status = f"error: {e}"
         print(f"[grab] {job.status}")
         return False
@@ -1445,16 +891,14 @@ def report_task_exception(task: asyncio.Task) -> None:
         print(f"[grab] grasp task crashed: {task.exception()!r}")
 
 
-async def stop_everything(arm: Arm, job: Optional[GraspJob], *, reason: str = "stop requested") -> None:
+async def stop_everything(arm: Arm, job: Optional[GraspJob]) -> None:
     """Cancel the grasp first (so it sends nothing new), then stop the arm."""
-    print(f"[main] STOP requested: {reason}" + (f"; last action: {job.status}" if job else ""), flush=True)
     if job is not None and job.task is not None and not job.task.done():
         job.task.cancel()
     if EXECUTE:
-        print("[main] STOP: requesting arm.stop(). The physical E-stop is the real stop.", flush=True)
+        print("[main] STOP: arm.stop() sent. The physical E-stop is the real stop.")
         try:
             await asyncio.wait_for(arm.stop(), timeout=2.0)
-            print("[main] arm.stop() acknowledged", flush=True)
         except Exception as e:
             print(f"[main] arm.stop() failed ({type(e).__name__}: {e}): USE THE E-STOP")
     if job is not None and job.task is not None:
@@ -1509,7 +953,6 @@ def make_delivery_io(robot: RobotClient, motion: MotionClient, gripper: Gripper,
         dry_run=DRY_RUN, reach_mm=ARM_REACH_MM, table_top_z=TABLE_TOP_Z_MM,
         camera_name=CAMERA_NAME, world_frame=MOTION_REFERENCE_FRAME,
         intrinsics=intr, frame_w=frame_w, frame_h=frame_h,
-        return_after_release=lambda held, status: return_after_release(motion, held, status),
     )
 
 
@@ -1575,13 +1018,6 @@ async def run_session(machine: RobotClient, recovering: bool = False):
             raise RuntimeError("Reconnected, but the gripper reports holding an object. "
                                "Check the arm before restarting; no action was replayed.")
 
-    require_grasp_calibration()  # Before any startup movement.
-    if EXECUTE:
-        try:
-            await require_arm_joint_ranges(arm)
-        except JointRangeError as error:
-            raise SystemExit(f"START BLOCKED: {error}\nNo startup or grasp command was sent.") from None
-
     serve = load_serve_pose()
     if serve is None:
         print("[main] no serve_pose.json: 'Bring to me', Closer/Away and head steering are off until you run "
@@ -1592,30 +1028,20 @@ async def run_session(machine: RobotClient, recovering: bool = False):
 
     tcp_mm = await measure_tcp_mm(motion)
     intr = await get_intrinsics(cam)
-    print(f"[main] flange->TCP {tcp_mm:.0f} mm; flange->body {GRIPPER_BODY_FROM_FLANGE_MM:.1f} mm; "
-          f"body->fingertips {FINGER_CLEARANCE_MM:.1f}..{MAX_FINGER_EXTENSION_MM:.1f} mm; camera intrinsics "
+    print(f"[main] gripper TCP {tcp_mm:.0f} mm from the flange -> fingertips "
+          f"{max(0.0, FINGERTIP_FROM_FLANGE_MM - tcp_mm):.0f} mm beyond it; camera intrinsics "
           + (f"fx={intr.fx:.0f} fy={intr.fy:.0f} at {intr.width}x{intr.height}" if intr else "UNAVAILABLE"))
 
     home = load_home_pose()
     if home is None:
         print("[main] no home_pose.json; objects are carried back to where the gripper was when locked")
-    elif not GO_HOME_ON_START:
-        print("[main] saved return pose loaded; startup movement is off (opt in with --go-home-on-start)")
     elif GO_HOME_ON_START and EXECUTE and not recovering:
-        startup_job = GraspJob()
         try:
-            startup_ok = await move_to(motion, home, "startup home", startup_job, constraints=upright())
+            await move_to(motion, home, "home", GraspJob(), constraints=upright())
         except Exception as error:
             # A lost response cannot tell us whether a motion command ran.
             raise RuntimeError("Startup movement failed. Check the arm before restarting; "
                                "the movement will not be retried automatically.") from error
-        if not startup_ok:
-            if startup_job.plan_rejection is not None:
-                raise SystemExit(f"Startup paused: {startup_job.plan_rejection}\n"
-                                 "Check the saved home pose and gripper/table geometry before restarting. "
-                                 "No grasp was started; no movement will be retried automatically.")
-            raise SystemExit(f"Startup stopped: {startup_job.status}. Check the arm before restarting; "
-                             "no grasp was started and no movement will be retried automatically.")
 
     gaze = WebcamGazeTracker(camera_index=WEBCAM_INDEX)
     lock = GazeLockController()
@@ -1626,7 +1052,6 @@ async def run_session(machine: RobotClient, recovering: bool = False):
     live_blocked_until = 0.0
     hovered, progress = None, 0.0
     keep_window = False
-    operator_fault: Optional[OperatorFault] = None
 
     try:
         frame_w, frame_h = await feed.first()
@@ -1651,107 +1076,12 @@ async def run_session(machine: RobotClient, recovering: bool = False):
             live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
 
         while True:
-            if operator_fault is None:
-                fault_reason, fault_error = None, None
-                if job is not None and (job.requires_operator or (
-                        job.connection_error is not None and (job.motion_started or job.held is not None))):
-                    fault_reason = f"Physical action interrupted: {job.status}"
-                    fault_error = getattr(job, "action_error", None) or job.connection_error
-                elif session is not None and (getattr(session, "requires_operator", False)
-                                               or session.error is not None):
-                    fault_reason = f"Delivery interrupted: {session.message}"
-                    fault_error = session.error
-                elif feed.connection_error is not None and (held is not None or session is not None
-                        or (job is not None and (job.motion_started or job.held is not None))):
-                    fault_reason = "Connection lost during object handling"
-                    fault_error = feed.connection_error
-                if fault_reason is not None:
-                    if is_session_expired(fault_error):
-                        fault_reason = "Viam safety session expired during the physical action"
-                    operator_fault = OperatorFault(fault_reason)
-                    feed.paused = True
-                    # Cancel the action before one best-effort stop. Never
-                    # replay its open/close/move after a session or RPC error.
-                    if session is not None and session.busy:
-                        session.task.cancel()
-                        await asyncio.gather(session.task, return_exceptions=True)
-                    await stop_everything(arm, job, reason=fault_reason)
-                    print(f"[main] PAUSED: {fault_reason}. No command will be replayed. "
-                          "Use robot controls to put down any object and open the jaws; "
-                          "R then verifies stopped/open/empty state.")
-            if operator_fault is not None:
-                feed.paused = True
-                if operator_fault.poll_check():
-                    print(f"[main] {operator_fault.detail}; failed action discarded, waiting for fresh selection")
-                    # Only verified open/empty recovery may discard a known
-                    # held object. Until here all object state is retained.
-                    held, job, session, operator_fault = None, None, None, None
-                    lock.release()
-                    estimator.reset()
-                    feed.obs = None
-                    live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
-                    continue
-                lines = ["ACTION PAUSED - no automatic retry"]
-                lines.extend(textwrap.wrap(operator_fault.reason, width=90))
-                lines.extend(textwrap.wrap(operator_fault.detail, width=90))
-                lines.append("R check cleared gripper | Q quit")
-                if lock.is_locked:
-                    canvas = draw_locked(lock.locked, lines)
-                else:
-                    canvas = ((feed.obs.frame * 0.5).astype(np.uint8) if feed.obs is not None
-                              else np.zeros((frame_h, frame_w, 3), dtype=np.uint8))
-                    for i, line in enumerate(lines):
-                        put_text(canvas, line, (16, 40 + 36 * i), 0.65)
-                cv2.imshow(WINDOW, canvas)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break  # The interrupted action was already stopped once.
-                if key == ord("r"):
-                    operator_fault.start_check(lambda: check_action_recovery(
-                        arm, gripper, lambda: read_gripper_position(gripper),
-                        lambda: gripper_world_pose(motion)))
-                await asyncio.sleep(0.03)
-                continue
             if session is not None and session.error is not None and is_transport_error(session.error):
                 raise ReconnectRequired("Connection lost during delivery") from session.error
             if job is not None and job.connection_error is not None:
                 raise ReconnectRequired("Connection lost during grasp processing") from job.connection_error
             if feed.connection_error is not None:
                 raise ReconnectRequired("Connection lost during capture") from feed.connection_error
-            if job is not None and job.done and not job.ok:
-                # Keep failed attempts visible until the operator acknowledges
-                # them. A timeout must not reselect the same object by gaze.
-                feed.paused = True
-                lines = [job.status]
-                failure_detail = job.plan_rejection or job.motion_failure
-                if failure_detail is not None and failure_detail != job.status:
-                    lines.append(failure_detail)
-                lines.append("Paused after failed attempt | R acknowledge | Q stop+quit")
-                if lock.is_locked:
-                    canvas = draw_locked(lock.locked, lines)
-                else:
-                    canvas = ((feed.obs.frame * 0.5).astype(np.uint8) if feed.obs is not None
-                              else np.zeros((frame_h, frame_w, 3), dtype=np.uint8))
-                    for i, line in enumerate(lines):
-                        put_text(canvas, line, (16, 40 + 36 * i), 0.65)
-                cv2.imshow(WINDOW, canvas)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    await stop_everything(arm, job, reason="Q pressed on failed-attempt screen")
-                    break
-                if key == ord("r"):
-                    held = job.held
-                    if MENU and held is not None:
-                        session = DeliverySession(delivery_io, held, serve,
-                                                  head_mode=USER_PROFILE == "head", head_range=head_range)
-                        print(f"[deliver] acknowledged failed attempt; holding the {held.label}: showing the menu")
-                    else:
-                        lock.release()
-                        estimator.reset()
-                        live_blocked_until = time.monotonic() + LIVE_COOLDOWN_S
-                    job = None
-                await asyncio.sleep(0.03)
-                continue
             if session is not None:
                 # HOLDING: the arm has the object; the menu (or steering) decides what happens.
                 feed.paused = not session.wants_feed
@@ -1783,9 +1113,9 @@ async def run_session(machine: RobotClient, recovering: bool = False):
                 cv2.imshow(WINDOW, view)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
-                    await stop_everything(arm, job, reason="Q pressed during put-back")
+                    await stop_everything(arm, job)
                     break
-                if job.done and job.ok:
+                if job.done and (job.ok or time.monotonic() - job.finished_at > RELEASE_AFTER_SECONDS):
                     held = job.held
                     job = None
                     estimator.reset()
@@ -1800,7 +1130,7 @@ async def run_session(machine: RobotClient, recovering: bool = False):
                 cv2.imshow(WINDOW, draw_locked(lock.locked, lines))
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
-                    await stop_everything(arm, job, reason="Q pressed during selected-object action")
+                    await stop_everything(arm, job)
                     break
                 if job is not None and job.done and not MENU:
                     held = job.held   # what the gripper has now (a swap may have put one down)
@@ -1811,9 +1141,10 @@ async def run_session(machine: RobotClient, recovering: bool = False):
                     job = None
                     continue
                 if job is not None and job.done:
-                    # Failed attempts are handled by the acknowledgement gate
-                    # above. Successful demo picks can resume selection.
-                    if (job.ok and not MENU) or key == ord("r"):
+                    # Demo mode: straight back to choosing after a success;
+                    # after a failure, leave the reason up for a few seconds.
+                    if ((job.ok and not MENU) or key == ord("r")
+                            or time.monotonic() - job.finished_at > RELEASE_AFTER_SECONDS):
                         lock.release()
                         estimator.reset()
                         job = None
@@ -1893,7 +1224,7 @@ async def run_session(machine: RobotClient, recovering: bool = False):
         if is_transport_error(error) and (
                 held is not None or session is not None
                 or (job is not None and (job.motion_started or job.held is not None))):
-            await stop_everything(arm, job, reason=f"connection error: {type(error).__name__}: {error}")
+            await stop_everything(arm, job)
             raise RuntimeError("Connection lost during object handling. Check the arm before restarting; "
                                "the interrupted action will not be replayed.") from error
         # Calibration refers to the window's physical screen position. Keep
@@ -1906,14 +1237,9 @@ async def run_session(machine: RobotClient, recovering: bool = False):
             cv2.waitKey(1)
         raise
     finally:
-        if operator_fault is not None:
-            await operator_fault.cancel_check()
         await feed.stop()
         if job is not None and job.task is not None and not job.task.done():
-            pending_error = sys.exc_info()[1]
-            reason = (f"session interrupted by {type(pending_error).__name__}: {pending_error}"
-                      if pending_error is not None else "session closed while action was pending")
-            await stop_everything(arm, job, reason=reason)
+            await stop_everything(arm, job)
         if session is not None and session.busy:
             try:
                 await session.stop("Quit")
