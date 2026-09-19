@@ -196,9 +196,9 @@ segmentation, transforms and safety checks all run and every pose is printed,
 but nothing is sent to the arm or gripper. `Q` cancels a grasp and sends
 `arm.stop()`, best effort; the physical E-stop is the real stop.
 
-Every run starts with the face-framing oval, then calibration (~70 s):
+Every run starts with the face-framing oval, then calibration (~55 s):
 
-1. **Head still**, eyes only: a 5x5 grid of dots.
+1. **Head still**, eyes only: nine dots (corners, edge middles, center).
 2. **Eight directions** (upper left, top, upper right, right, lower right,
    bottom, lower left, left). Each starts with a "turn your head" screen:
    your webcam view, an arrow and the instruction to turn your head

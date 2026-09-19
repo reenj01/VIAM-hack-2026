@@ -107,7 +107,7 @@ class GripperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 arm = SimpleNamespace(do_command=AsyncMock())
                 job = app.GraspJob()
 
-                with patch.object(app, "DRY_RUN", False):
+                with patch.object(app, "DRY_RUN", False), patch.object(app, "GRIPPER_CLOSE_FULLY", False):
                     with self.assertRaises(type(failure)) as caught:
                         await app.close_gripper(gripper, arm, 40.0, job)
 

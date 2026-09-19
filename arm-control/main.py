@@ -239,6 +239,11 @@ GRIPPER_MIN_CLOSURE_POS = 10
 GRIPPER_POSITION_TOLERANCE = 6
 GRIPPER_VERIFY_TIMEOUT_S = 3.0
 GRIPPER_MAX_WIDTH_ERROR_MM = 5.0
+# Close all the way and let the object stop the jaws (the gripper's own force
+# limit holds it). Fully closed jaws still mean "nothing grabbed".
+# False = the older close to the estimated width.
+GRIPPER_CLOSE_FULLY = True
+GRIPPER_FULL_CLOSE_POS = 0
 
 # Home / serve pose: record once with the arm parked there
 # (python main.py --set-home -> home_pose.json). Without it, the object is
@@ -985,7 +990,7 @@ async def close_gripper(gripper: Gripper, arm: Arm, width_mm: float, job: GraspJ
     max_span_mm = GRIPPER_MAX_POS / GRIPPER_POS_PER_MM
     if not math.isfinite(width_mm) or not 0 < width_mm <= max_span_mm:
         return unconfirmed(f"estimated width {width_mm:g} mm is outside the usable gripper span")
-    target = gripper_position_for_width(width_mm)
+    target = GRIPPER_FULL_CLOSE_POS if GRIPPER_CLOSE_FULLY else gripper_position_for_width(width_mm)
     if DRY_RUN:
         job.status = (f"DRY RUN, would close once to position {target} "
                       f"(object ~{width_mm:.0f} mm wide) and verify contact")

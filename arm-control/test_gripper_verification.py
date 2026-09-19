@@ -10,6 +10,7 @@ import main as app
 class GripperVerificationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(patch.object(app, "DRY_RUN", False))
+        self.enterContext(patch.object(app, "GRIPPER_CLOSE_FULLY", False))   # width-limited mode
         self.arm = SimpleNamespace(do_command=AsyncMock())
         self.job = app.GraspJob()
 
@@ -65,6 +66,20 @@ class GripperVerificationTests(unittest.IsolatedAsyncioTestCase):
         gripper = self.gripper(positions=(840, 600, 600, 600), response={"position": 600})
         self.assertFalse(await self.close(gripper))
         self.assertIn("too far apart", self.job.status)
+
+    async def test_full_close_stops_on_the_object_and_holds(self):
+        with patch.object(app, "GRIPPER_CLOSE_FULLY", True):
+            gripper = self.gripper(positions=(840, 420, 420, 420), response={"position": 420})
+            self.assertTrue(await self.close(gripper))
+        commands = [call.args[0] for call in gripper.do_command.await_args_list]
+        self.assertEqual(commands[1], {"set": 0})
+        self.assertTrue(self.job.holding)
+
+    async def test_full_close_with_nothing_between_the_jaws_is_not_holding(self):
+        with patch.object(app, "GRIPPER_CLOSE_FULLY", True):
+            gripper = self.gripper(positions=(840, 0, 0, 0), response={"position": 0})
+            self.assertFalse(await self.close(gripper))
+        self.assertIn("endpoint", self.job.status)
 
     async def test_close_requires_previously_opened_jaws(self):
         gripper = self.gripper(positions=(820,))

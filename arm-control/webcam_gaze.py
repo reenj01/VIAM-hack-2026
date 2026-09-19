@@ -70,7 +70,7 @@ OUT_OF_RANGE_MARGIN = 0.15        # prediction beyond the window by more than th
 # Calibration targets: an n x n grid inside CAL_MARGIN, ordered center first,
 # then ring by ring outward, each ring walked around its perimeter (short hops).
 CAL_MARGIN = 0.15
-STRAIGHT_GRID_N = 5   # the head pose used most: dense, so mid-diagonals and interior points are measured
+STRAIGHT_GRID_N = 3   # head-still stage: the nine positions (corners, edge middles, center)
 
 
 def grid_targets(n: int) -> list[tuple[float, float]]:
@@ -86,18 +86,18 @@ def grid_targets(n: int) -> list[tuple[float, float]]:
     return [p for _, _, p in pts]
 
 
-# Head-pose stages: (name, where, targets). The straight stage is the 5x5 grid
+# Head-pose stages: (name, where, targets). The straight stage is the 3x3 grid
 # with the head still, eyes only. Each directional stage starts with a
 # "turn your head" step (webcam view, an arrow, the instruction): a SLIGHT
 # turn toward that side, like an attention shift, not a full turn. Then two
 # dots: the midpoint toward that side and the edge/corner, e.g. up-left =
-# upper-middle-left and upper-left. Those same points are also in the straight
-# grid, so the model sees each one with and without the head's help, which is
-# what teaches it the head/eye coupling.
+# upper-middle-left and upper-left. The edge/corner dots are also in the
+# straight grid, so the model sees them with and without the head's help,
+# which is what teaches it the head/eye coupling.
 # The turn step is timed, not gated: an earlier version waited for a measured
 # turn and learned left/up from the first stage, which subtle movements never
 # reached, so its gauge accepted any direction. Space starts the dots early.
-LO, NEAR, MID, FAR, HI = (float(v) for v in np.linspace(CAL_MARGIN, 1 - CAL_MARGIN, STRAIGHT_GRID_N))
+LO, NEAR, MID, FAR, HI = (float(v) for v in np.linspace(CAL_MARGIN, 1 - CAL_MARGIN, 5))   # edge, midpoint, center levels
 HEAD_STAGES = [
     ("straight", "", None),
     ("up-left", "UPPER LEFT", [(NEAR, NEAR), (LO, LO)]),
