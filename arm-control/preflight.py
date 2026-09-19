@@ -15,19 +15,36 @@ import time
 
 from grpclib import GRPCError, Status
 
-from viam.components.arm import Arm
 from viam.components.camera import Camera
+from viam.components.arm import Arm
 from viam.components.gripper import Gripper
 from viam.proto.common import Pose
 from viam.services.vision import VisionClient
 from viam.services.motion import MotionClient
 
 from main import (
-    ARM_NAME, CAMERA_NAME, DETECTOR_CANDIDATES, DETECTOR_NAME, FINGERTIP_FROM_FLANGE_MM, GRIPPER_NAME,
-    MIN_DOWNWARD_O_Z, MOTION_REFERENCE_FRAME, MOTION_SERVICE_NAME, SEGMENTER_NAME, SEGMENTER_TIMEOUT_S,
+    ARM_NAME, CAMERA_NAME, DETECTOR_CANDIDATES, DETECTOR_NAME, GRIPPER_NAME,
+    FINGER_CLEARANCE_MM, MAX_FINGER_EXTENSION_MM, GRIPPER_BODY_FROM_FLANGE_MM,
+    GRASP_Z_OFFSET_MM, GRIPPER_BODY_CLEARANCE_MM,
+    MOTION_REFERENCE_FRAME, MOTION_SERVICE_NAME, SEGMENTER_NAME, SEGMENTER_TIMEOUT_S,
     TABLE_TOP_Z_MM, connect, decode_color_frame, decode_viam_image, get_intrinsics, measure_tcp_mm,
     object_center_and_size, object_label, object_reference_frame, pose_in, project_to_pixel, target_problem,
+    read_gripper_position, require_grasp_calibration,
+    plan_grasp, world_box_extents, MEASURED_OBJECT_WIDTHS_MM, load_home_pose,
 )
+from grasp_checks import load_grasp_model, check_model_clearance, geometry_z_bounds
+from joint_checks import read_arm_joint_ranges
+
+
+async def check_joints(machine):
+    readings = await read_arm_joint_ranges(Arm.from_robot(machine, ARM_NAME))
+    for i, r in enumerate(readings, 1):
+        print(f"   J{i} ({r.name}): {r.degrees:.3f} deg; model [{r.minimum:g}, {r.maximum:g}] deg "
+              f"{'PASS' if r.in_range else 'OUT OF RANGE'}")
+    if not all(r.in_range for r in readings):
+        print("   Move the affected joint safely inside its range using operator controls before execution.")
+        return False
+    return True
 
 
 async def step(title, coro, failures=None):
@@ -124,6 +141,10 @@ async def check_segmenter(machine, detector_labels, intr):
             print("   Label overlap does not verify segmenter wiring; these calls also capture different frames. "
                   "Check detector_name in the segmenter's configuration to verify its source.")
     verdicts = []
+    mo = MotionClient.from_robot(machine, motion_name({r.name for r in machine.resource_names}))
+    current = (await mo.get_pose(GRIPPER_NAME, MOTION_REFERENCE_FRAME)).pose
+    tcp = await measure_tcp_mm(mo)
+    model = await load_grasp_model(machine, Gripper.from_robot(machine, GRIPPER_NAME))
     for i, o in enumerate(objs):
         cs = object_center_and_size(o)
         ref = object_reference_frame(o)
@@ -132,7 +153,7 @@ async def check_segmenter(machine, detector_labels, intr):
             verdicts.append(False)
             continue
         c, s = cs
-        w = await pose_in(machine, Pose(x=c.x, y=c.y, z=c.z, o_z=1.0), ref, MOTION_REFERENCE_FRAME)
+        w = await pose_in(machine, c, ref, MOTION_REFERENCE_FRAME)
         problem = target_problem(w)
         verdicts.append(problem is None)
         pix = ""
@@ -143,8 +164,22 @@ async def check_segmenter(machine, detector_labels, intr):
         print(f"     [{i}] '{object_label(o)}' in '{ref}' ({c.x:.0f}, {c.y:.0f}, {c.z:.0f}) -> world "
               f"({w.x:.0f}, {w.y:.0f}, {w.z:.0f})  size {s[0]:.0f}x{s[1]:.0f}x{s[2]:.0f}{pix}  "
               + ("PASS" if problem is None else f"FAIL: {problem}"))
+        extent = world_box_extents(w, s)
+        print(f"         world box bottom/top z={w.z - extent[2]/2:.1f}/{w.z + extent[2]/2:.1f} mm")
+        try:
+            if abs(model.table_top_z_mm - TABLE_TOP_Z_MM) > 1.0:
+                raise ValueError("Live table height differs from the grasp calculation's table height")
+            plan = plan_grasp(w, s, current, tcp, None)
+            width = MEASURED_OBJECT_WIDTHS_MM.get(object_label(o).lower(), plan.width_mm)
+            print(f"         proposed TCP z={plan.grasp.z:.1f} mm; grasp width={width:.1f} mm "
+                  f"({'measured' if object_label(o).lower() in MEASURED_OBJECT_WIDTHS_MM else 'estimated'})")
+            clearance = check_model_clearance(model, plan.grasp)
+            print(f"         model/table gap={clearance.clearance_mm:.1f} mm; NO movement sent")
+        except ValueError as error:
+            verdicts[-1] = False
+            print(f"         GRASP BLOCKED: {error}")
     if verdicts:
-        print(f"   coarse workspace range check: {'PASS' if all(verdicts) else 'FAIL'} "
+        print(f"   workspace and proposed grasp checks: {'PASS' if all(verdicts) else 'FAIL'} "
               f"(configured table top z~{TABLE_TOP_Z_MM:.0f} mm). "
               "This does not validate camera calibration, mounting transforms, or grasp accuracy. "
               "Compare the pixel column with the object boxes and world positions with measured locations.")
@@ -157,17 +192,10 @@ async def check_gripper(machine):
     gr = Gripper.from_robot(machine, GRIPPER_NAME)
     print("   is_moving:", await gr.is_moving())
     print("   is_holding_something:", await gr.is_holding_something())
-    arm = Arm.from_robot(machine, ARM_NAME)
-    for who, label, cmd in ((gr, f"gripper '{GRIPPER_NAME}'", {"get": True}),
-                            (arm, f"arm '{ARM_NAME}'", {"get_gripper": True})):
-        try:
-            resp = await who.do_command(cmd)
-            print(f"   do_command {cmd} on {label}: {resp}  <- width-based close works via this component")
-            break
-        except Exception as e:
-            print(f"   do_command {cmd} on {label}: not accepted ({type(e).__name__})")
-    else:
-        print("   no component accepts gripper do_commands; main.py will fall back to grab()")
+    position = await read_gripper_position(gr)
+    print(f"   position readback: {position:.0f}; a read does not verify the close command")
+    print("   Holding status may be inferred from jaw position. Picking also requires measured closure "
+          "and contact evidence; there is no automatic grab() fallback.")
 
 
 async def check_motion(machine):
@@ -180,13 +208,36 @@ async def check_motion(machine):
     print(f"   motion service '{mn}'")
     print(f"   gripper TCP in world: ({p.x:.0f}, {p.y:.0f}, {p.z:.0f}) mm, "
           f"orientation o=({p.o_x:.3f}, {p.o_y:.3f}, {p.o_z:.3f}) theta={p.theta:.1f}")
-    print("   -> grasps reuse this wrist orientation" if p.o_z <= MIN_DOWNWARD_O_Z else
-          "   -> not pointing down: grasps will use DEFAULT_GRASP_ORIENTATION instead")
+    norm = math.hypot(p.o_x, p.o_y, p.o_z)
+    vertical = norm > 0 and -p.o_z / norm >= math.cos(math.radians(5))
+    print("   -> downward grasp orientation OK" if vertical else
+          "   -> INCOMPLETE: gripper must point downward within 5 degrees before picking")
     tcp = await measure_tcp_mm(mo)
-    print(f"   gripper TCP is {tcp:.0f} mm from the flange; fingertips assumed {FINGERTIP_FROM_FLANGE_MM:.0f} mm "
-          f"-> {max(0.0, FINGERTIP_FROM_FLANGE_MM - tcp):.0f} mm beyond the TCP (tape-measure flange->fingertip "
-          "and set FINGERTIP_FROM_FLANGE_MM if grasps land high or low)")
+    print(f"   gripper TCP is {tcp:.0f} mm from the flange; hinged fingertips require extension bounds")
     print(f"   height above the table top: TCP {p.z - TABLE_TOP_Z_MM:.0f} mm, reach {math.hypot(p.x, p.y):.0f} mm")
+    try:
+        require_grasp_calibration()
+    except ValueError as error:
+        print(f"   INCOMPLETE: {error}")
+        return False
+    print(f"   flange->body {GRIPPER_BODY_FROM_FLANGE_MM:.1f} mm; body->tip range "
+          f"{FINGER_CLEARANCE_MM:.1f}..{MAX_FINGER_EXTENSION_MM:.1f} mm; body margin "
+          f"{GRIPPER_BODY_CLEARANCE_MM:.1f} mm; extra upward offset {GRASP_Z_OFFSET_MM:.1f} mm")
+    model = await load_grasp_model(machine, Gripper.from_robot(machine, GRIPPER_NAME))
+    downward = Pose(o_z=-1)
+    modeled_below_tcp = -min(geometry_z_bounds(g, downward)[0] for g in model.gripper_geometries)
+    physical_below_tcp = GRIPPER_BODY_FROM_FLANGE_MM + MAX_FINGER_EXTENSION_MM - tcp
+    print(f"   vertical extent below TCP: Viam collision model {modeled_below_tcp:.1f} mm; "
+          f"measured fingertips {physical_below_tcp:.1f} mm (difference "
+          f"{modeled_below_tcp - physical_below_tcp:.1f} mm)")
+    print("   Local finger measurements do not change Viam's collision geometry.")
+    home = load_home_pose()
+    if home is not None:
+        height = home.z - model.table_top_z_mm
+        print(f"   saved return pose: ({home.x:.1f}, {home.y:.1f}, {home.z:.1f}) mm; "
+              f"TCP {height:.1f} mm ({height / 25.4:.2f} inches) above configured table")
+        print("   After release: rise at drop X/Y first, then return to this saved pose.")
+    return vertical and math.isfinite(tcp) and tcp > 0
 
 
 async def main():
@@ -197,6 +248,7 @@ async def main():
         return 1
     try:
         await step("Resource names", check_names(machine), failures)
+        await step("Current arm joint ranges (read-only)", check_joints(machine), failures)
         intr = await step("Camera", check_camera(machine), failures)
         have = {r.name for r in machine.resource_names}
         detector_labels = {}

@@ -20,6 +20,10 @@ __pycache__/
 gaze_calibration.json
 webcam_gaze_calibration.json
 
+# Taught return/serve poses belong to this particular robot setup
+arm-control/home_pose.json
+arm-control/serve_pose.json
+
 # Test recordings
 *.mp4
 *.mov

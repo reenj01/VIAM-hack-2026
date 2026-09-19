@@ -48,26 +48,148 @@ Copy `../.env.example` to `arm-control/.env` and fill in
 service/component names at the top of `main.py`, then:
 
 ```bash
-python main.py              # dry run: everything except motion, prints the poses
-python main.py --execute    # the arm moves
+python main.py --detector vision-1
+# Add --execute to enable physical movement after calibration is checked.
 ```
 
+Calibration uses three axial distances in millimeters:
+
+- Fixed flange-to-housing distance: the user measured approximately **3.85
+  inches**, saved as **97.8 mm**. `--gripper-body-from-flange-mm` overrides
+  this value if the hardware or mounting changes.
+- Housing underside to fingertips, fully open: **2.3 inches**, saved as
+  **58.4 mm** (`--finger-clearance-mm` overrides the minimum).
+- Housing underside to fingertips, fully closed: **2.75 inches**, saved as
+  **69.9 mm** (`--max-finger-extension-mm` overrides the maximum).
+
+All three measured defaults are now saved, so no measurement flags are
+required for this setup. They bound the complete open/close stroke used in
+planning. The later direct measurements above supersede the initial approximate
+3-inch reading in the photo; the 3.3-inch sideways jaw opening is a different
+dimension. The previous assumed 165 mm flange-to-tip
+distance has been removed from planning. Hinged tips do not have one fixed
+distance from the flange.
+
 Run `python preflight.py` first for read-only camera, detector, segmentation,
-gripper, and frame checks. Use the same Python environment as `main.py`.
+gripper, frame, and proposed grasp/model-clearance checks. Use the same Python
+environment as `main.py`.
+
+For the current test block, the measured distance between gripping faces is
+**1.125 inches = 28.575 mm**. The recording estimated 49 mm and requested a
+48 mm opening, which is too wide to contact these faces. Use an explicit
+measurement for this test setup:
+
+```powershell
+python preflight.py --detector vision-1 --object-width-mm block=28.6
+python main.py --detector vision-1 --object-width-mm block=28.6
+```
+
+The second command is a dry run. The width option applies to every selected
+object with that label during that run; only use it when those objects have
+the measured width along the jaws' closing direction. It is not a universal
+width for all blocks. Without an override, width is still an approximate depth
+box estimate. A measured width does not correct the object's depth or position.
+
+The live collision model checked on 2026-09-19 extends the claws **50 mm below
+the TCP**, while the measured closed fingertips extend **17.7 mm**. With a
+table top at z=-23 mm, a requested TCP z=18 mm overlaps that model with the
+table. Picking now reads the actual modeled boxes and refuses such a pose
+before approaching. It does not shrink the geometry or shift the table.
+Resolve the physical/model calibration if this check blocks a grasp; raising
+the pose blindly can leave the fingers above a short object.
 
 The display detector must correspond to the segmenter's detections. On the
 2026-09-19 live check, `vision-1`'s can box contained the projected 3D can
 center; `yolo-detector`'s cup box did not. For that setup, use
 `python preflight.py --detector vision-1`, then
-`python main.py --detector vision-1 --execute` to enable motion. The default
-remains `yolo-detector`; `--detector` explicitly selects the service to use.
+`python main.py --detector vision-1`. Add `--execute` to
+enable motion. The default remains `yolo-detector`; `--detector` explicitly
+selects the service to use.
+
+Grasp height positions the **rigid housing above the 3D object's world top**.
+It targets at most 15 mm insertion for the shortest finger extension. The
+longest extension must clear the table; the body margin includes possible
+object lift caused by retracting fingers during closure. If the measured
+range cannot satisfy both table clearance and finger overlap, picking is
+refused. A 15 mm body margin also allows for small wrist tilt. The gripper
+must point down within 5 degrees. Add
+`--grasp-z-offset-mm 5` for another 5 mm upward adjustment. An offset that
+leaves no finger overlap is rejected. These margins depend on accurate depth,
+camera calibration, the fixed housing datum, and measured extension bounds.
+
+The gripper now verifies that it opened before descending and actually
+reached a stationary grasp pose before closing, then checks closure before
+lifting. Two pose readbacks must be within 5 mm and 2 degrees of the requested
+grasp. It uses a single position-limited close, with 1 mm
+requested squeeze instead of 8 mm, and verifies stable contact evidence.
+An empty partial close, unchanged jaws, or an unacknowledged command cannot
+become a successful pickup. A failed verification opens at the table and
+retreats; an exception during a physical action stops automatic selection.
+The specific IK constraint rejection shown in the recording now pauses on
+screen instead of crashing. All unsuccessful attempts require **R** to
+acknowledge before selection resumes; no attempt automatically repeats after
+a timeout. No further movement is sent after a rejected movement, and detected
+obstacles are never discarded to retry a plan.
+
+### Expired sessions and duplicate geometry names
+
+`requesting move to approach` means the motion RPC was submitted, not that the
+arm has physically started moving. A pending request prints elapsed time every
+five seconds; planning and execution share the same RPC. Completion, errors,
+and cancellation report elapsed time. STOP logs its cause (Q, a detected fault,
+or session cleanup) and whether `arm.stop()` acknowledged the request.
+
+`INVALID_ARGUMENT: SESSION_EXPIRED` is a Viam safety-session failure, separate
+from detection. The failed motor command is not replayed. The app stops once
+and keeps a fault screen open. **R** performs read-only checks: arm and jaws
+stopped, gripper fully open, holding status false, and a valid current pose.
+Selection resumes only if these checks succeed; otherwise the fault stays
+visible. Use the robot controls to put down any held object and open the jaws
+before acknowledging an uncertain grip. A dead connection can be rebuilt only after these checks; startup home
+movement is not replayed during connection recovery.
+
+Multiple detected cans used to create identically named `can` collision
+geometries. Planner geometries now receive unique IDs, including after merging
+obstacles with a saved object footprint. Detection labels remain unchanged.
+This fixes the duplicate-name error; it does not remove overlapping detections
+or validate their depth. Implausible depth results are still rejected.
+
+### Return after placing or releasing an object
+
+The requested pose was read from the robot on 2026-09-19 and saved locally in
+`home_pose.json`: approximately **(191, -304, 383) mm** in world coordinates.
+The TCP is **406 mm (16.0 inches) above the configured table** at this pose.
+This measured pose takes precedence over the approximate 14-inch request.
+The file is ignored by Git because it belongs to this robot setup.
+Starting the app does not move to this pose by default. `--go-home-on-start`
+explicitly enables the startup move; post-pick and post-drop returns still use
+the saved pose without that flag.
+
+After each verified release, including a swap, the arm first rises vertically
+at the actual drop X/Y to the saved return height, then returns to the saved
+X/Y. For a release already near or above that height, it rises at least 40 mm
+before returning. Other detected obstacles remain active, and the released
+object is included in the model for the return across the table. An elevated
+"Let go" includes the vertical drop region down to the table; this assumes a
+vertical fall and does not predict bouncing or rolling. A rejected
+ascent never proceeds to the lateral return. A failed return leaves the object
+marked released and pauses instead of claiming success or offering holding
+actions. No physical return was executed during development.
+
+Teach a replacement pose with `python main.py --set-home --detector vision-1`
+after manually parking the robot where it should return; teaching only reads
+and saves the pose. Without a taught pose, post-release return uses at least
+355.6 mm above the configured table at the pick approach X/Y.
+There is no full-close `grab()` fallback. Position checks and estimated width
+do **not** provide force control or guarantee that delicate objects cannot
+be crushed sideways.
 
 The SDK's one-second connection probe is disabled because slow vision requests
 can trigger it. If the transport closes while choosing an object, the app
 reconnects with fresh resource handles, clears the selection, and keeps the
 calibration window in place. It does not repeat the startup home movement.
-A connection loss during object handling ends the run and requires checking
-the arm before restarting; the interrupted action is not replayed.
+A connection loss during object handling pauses for operator recovery;
+the interrupted action is not replayed.
 
 **Motion is opt-in.** Without `--execute`, the camera, YOLO, gaze, lock, 3D
 segmentation, transforms and safety checks all run and every pose is printed,
@@ -100,7 +222,9 @@ the gaze mapping is to pixels on your physical screen.
    (`CaptureAllFromCamera`), so the boxes on screen and the lock snapshot
    always belong to the same frame. The HUD says `UNPAIRED` if the detector
    can't do that and it falls back to separate calls.
-2. On lock, while the arm is still: one 3D segmentation; the target is the
+2. On lock, while the arm is still: two independent 3D segmentations must agree
+   within 10 mm in position, top height, and world box dimensions. The wrist
+   must remain stationary. The target is the
    object whose center **projects into the locked box** (camera intrinsics),
    not a list position, so ordering and missing detections can't swap
    objects. If nothing lands there (e.g. the object moved), it doesn't move.
@@ -108,10 +232,10 @@ the gaze mapping is to pixels on your physical screen.
    before anything moves (the camera rides the wrist, so camera-frame values
    go stale the moment the arm moves).
 4. It refuses to move if the target isn't on the table or is out of reach.
-5. Approach 100 mm above, wrist orientation held (it reuses the wrist
-   orientation the arm already has, so the wrist never spins) -> open ->
-   straight-line descent -> close to the object's width -> straight up ->
-   carried back level.
+5. Compute a shallow grasp below the object's world top with body clearance.
+   Approach 100 mm above, wrist orientation held -> verify open jaws ->
+   straight-line descent -> verify stationary arrival -> close once and verify contact -> straight up ->
+   carried back level. Failed verification does not enter the carry phase.
 
 ## Demo mode (default): pick, then swap
 
@@ -127,7 +251,7 @@ trigger a swap. The new object (and every other one) is located and frozen
 into world coordinates *before* anything moves; the put-back avoids the new
 object, and the new grasp avoids the spot the old one went back to. The
 object in the gripper, if the wrist camera sees it, is never a target or an
-obstacle. If the put-back can't be planned the arm backs up and keeps
+obstacle. If the put-back can't be planned, the job pauses and the gripper keeps
 holding. The gripper only opens once the object is down.
 
 `P` (keyboard, for the operator) puts the held object back without picking
@@ -186,11 +310,10 @@ python main.py --user head        # head + eyes profile (dry run)
 
 - Hardware: UFactory xArm6 + UFactory two-finger gripper, RealSense D435 on
   the wrist, arm at 60 deg/s. Frames come from the hackathon fragment.
-- The **gripper frame is 150 mm** from the flange (the deck says 105): the TCP
-  is already near the finger pads. Fingertips are assumed 165 mm out, so
-  they end ~15 mm beyond the TCP; main.py measures the TCP distance at
-  startup. If grasps land high or low, tape-measure flange-to-fingertip and
-  set `FINGERTIP_FROM_FLANGE_MM`.
+- The **gripper frame is 150 mm** from the flange (the deck says 105).
+  `main.py` measures this TCP offset at startup and converts from the measured
+  rigid housing datum. It does not assume that the hinged fingertips stay
+  at a fixed position relative to that frame.
 - The camera frame is a calibrated value, `(83, -14, 18)` mm, theta -97.7.
   `preflight.py` checks broad workspace height and reach limits. To verify
   the mounting transform, compare reported world coordinates with measured
@@ -202,16 +325,25 @@ python main.py --user head        # head + eyes profile (dry run)
 - A `pose-home` switch already stores the observe pose. `--set-home` saves
   our own `home_pose.json`; without it, objects are carried back to where
   the gripper was when the object was locked.
-- **Recommended config change:** the motion service has no joint limits, so
-  the planner may pick solutions that spin the wrist or flip the elbow. On
-  the `motion` service's config, add
-  `{"input_range_override": {"arm": {"5": {"min": -3.1416, "max": 3.1416}}}}`
-  (radians) to keep the last joint within one turn.
+- **Joint range check:** the live xArm6 model already declares joint limits.
+  On 2026-09-19, J6 (`gripper_rot`) read **-359.994 degrees** against a model
+  range of **-359 to +359 degrees**. The rejected trajectory began at this
+  out-of-range readback. `preflight.py` now lists all six joint values and
+  limits, and execution checks them before startup movement or calibration.
+  An out-of-range start prints `START BLOCKED` and sends no grasp/home command.
+  Use the robot's operator joint controls to jog the affected joint safely
+  inside its range, then restart. Do not widen the model limits or normalize
+  -360 degrees to zero to conceal this mismatch.
+  A motion-service `input_range_override` can narrow planner ranges, but cannot
+  repair an already out-of-range starting joint. The earlier blanket claim
+  that this arm had no joint limits was incorrect.
 
 ## Things to verify on real hardware
 
-- `FINGERTIP_FROM_FLANGE_MM` (grasp height).
-- The width-based gripper close (`{"set": pos}`, 0-850 scale); it falls back
-  to `grab()` if rejected.
+- The fixed flange-to-housing distance (`--gripper-body-from-flange-mm`).
+- The full housing-to-fingertip extension range (`--finger-clearance-mm` and
+  `--max-finger-extension-mm`), including the fully open descent configuration.
+- The position-limited gripper close (`{"set": pos}`, 0-850 scale) and actual
+  position readback; no fallback close is attempted if it cannot be verified.
 - `preflight.py` passes, its projected pixels match the selected detector's
   boxes, and its world coordinates agree with measured object locations.
