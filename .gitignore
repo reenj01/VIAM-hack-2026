@@ -19,3 +19,14 @@ __pycache__/
 # Per-user gaze calibration (meaningless for anyone but the person who ran it)
 gaze_calibration.json
 webcam_gaze_calibration.json
+
+# Test recordings
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# YOLO training data, runs, and weights (share best.pt out of band)
+arm-control/dataset/
+arm-control/runs/
+*.pt

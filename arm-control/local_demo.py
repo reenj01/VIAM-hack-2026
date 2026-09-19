@@ -22,12 +22,10 @@ import cv2
 
 from gaze_lock import Box, GazeLockController, draw_live, draw_locked, filter_background_boxes
 from webcam_gaze import (
-    BLINK_EAR_THRESHOLD,
     CALIBRATION_PATH,
     GazeCalibration,
-    GazeSmoother,
+    GazeEstimator,
     WebcamGazeTracker,
-    estimate_gaze,
     run_calibration,
 )
 
@@ -101,6 +99,7 @@ def main():
     ap.add_argument("--conf", type=float, default=0.4)
     ap.add_argument("--detect-every", type=int, default=2, help="run YOLO every N frames (video/camera)")
     ap.add_argument("--skip-calibration", action="store_true", help="reuse the last saved calibration")
+    ap.add_argument("--quick-calibration", action="store_true", help="straight-head stage only (~12 s)")
     args = ap.parse_args()
 
     scene = Scene(args.scene)
@@ -111,22 +110,21 @@ def main():
 
     model = load_yolo(args.weights)
     gaze = WebcamGazeTracker(camera_index=args.webcam_index)
-    smoother = GazeSmoother()
     lock = GazeLockController()
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
 
     def calibrate() -> GazeCalibration:
-        return run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True)
+        return run_calibration(gaze, frame_w, frame_h, window_name=WINDOW, keep_window=True,
+                               quick=args.quick_calibration)
 
-    calib = None
-    if args.skip_calibration and CALIBRATION_PATH.exists():
-        calib = GazeCalibration.load()
-        if (calib.frame_w, calib.frame_h) != (frame_w, frame_h):
-            print("[demo] saved calibration is for a different frame size, recalibrating")
-            calib = None
+    calib = GazeCalibration.load() if args.skip_calibration else None
+    if calib is not None and (calib.frame_w, calib.frame_h) != (frame_w, frame_h):
+        print("[demo] saved calibration is for a different frame size, recalibrating")
+        calib = None
     if calib is None:
         calib = calibrate()
+    estimator = GazeEstimator(gaze, calib)
 
     boxes: list[Box] = []
     frame_idx = 0
@@ -137,7 +135,7 @@ def main():
                 key = cv2.waitKey(30) & 0xFF
                 if key == ord("r"):
                     lock.release()
-                    smoother.reset()
+                    estimator.reset()
                 elif key == ord("q"):
                     break
                 continue
@@ -153,8 +151,12 @@ def main():
                 boxes = detect(model, frame, args.conf)
             frame_idx += 1
 
-            gaze_pt, ear = estimate_gaze(gaze, calib, smoother)
-            hovered, progress, locked = lock.update(frame, boxes, gaze_pt)
+            gaze_pt, ear, blinking = estimator.read()
+            if blinking:
+                lock.hold()   # a blink neither adds nor removes attention
+                hovered, progress, locked = None, 0.0, None
+            else:
+                hovered, progress, locked = lock.update(frame, boxes, gaze_pt)
             if locked is not None:
                 b = locked.box
                 print(f"[lock] locked onto '{b.label}' ({b.confidence:.2f}) "
@@ -165,7 +167,7 @@ def main():
             if gaze_pt is None:
                 cv2.putText(view, "No face detected", (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 80, 255), 2, cv2.LINE_AA)
-            elif ear is not None and ear < BLINK_EAR_THRESHOLD:
+            elif blinking:
                 cv2.putText(view, "BLINK", (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.imshow(WINDOW, view)
@@ -175,7 +177,7 @@ def main():
                 break
             if key == ord("c"):
                 calib = calibrate()
-                smoother.reset()
+                estimator = GazeEstimator(gaze, calib)
     finally:
         gaze.close()
         scene.close()
