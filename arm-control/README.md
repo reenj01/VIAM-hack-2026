@@ -57,18 +57,20 @@ segmentation, transforms and safety checks all run and every pose is printed,
 but nothing is sent to the arm or gripper. `Q` cancels a grasp and sends
 `arm.stop()`, best effort; the physical E-stop is the real stop.
 
-Every run starts with the face-framing oval, then calibration (~50 s):
+Every run starts with the face-framing oval, then calibration (~70 s):
 
 1. **Head still**, eyes only: a 5x5 grid of dots.
 2. **Eight directions** (upper left, top, upper right, right, lower right,
-   bottom, lower left, left), two dots each: the midpoint toward that side,
-   then the edge or corner (e.g. upper-middle-left, then upper-left). Look at
-   them and let your head turn *slightly* with your eyes, the way it does
-   when your attention moves somewhere. No full head turns.
+   bottom, lower left, left). Each starts with a "turn your head" screen:
+   your webcam view, an arrow and the instruction to turn your head
+   *slightly* that way (a small attention turn, not a full one). It moves on
+   by itself after 3 s (Space = sooner). Then two dots: the midpoint toward
+   that side, then the edge or corner (e.g. upper-middle-left, then
+   upper-left); keep the head there and follow them with your eyes.
 
-Nothing measures or waits on the head angle; the user is trusted to look at
-the dots. Because the same points are also in the head-still grid, the model
-learns how much of a look comes from the eyes and how much from the head.
+Nothing measures or waits on the head angle. Because the same points are
+also in the head-still grid, the model learns how much of a look comes from
+the eyes and how much from the head.
 `S` skips a stage. `--quick-calibration` does the head-still stage only;
 `--skip-calibration` reuses the last one; `C` recalibrates mid-run.
 Blinks neither add nor remove selection evidence, and the cursor holds until

@@ -86,35 +86,33 @@ def grid_targets(n: int) -> list[tuple[float, float]]:
     return [p for _, _, p in pts]
 
 
-# Head-pose stages: (name, instruction, targets). The straight stage is the 5x5
-# grid with the head still, eyes only. In each directional stage the user looks
-# toward that side and lets the head follow slightly, as people do when their
-# attention moves there (a small turn, not a full one). It has just two
-# targets: the midpoint toward that side and the edge/corner, e.g. up-left =
+# Head-pose stages: (name, where, targets). The straight stage is the 5x5 grid
+# with the head still, eyes only. Each directional stage starts with a
+# "turn your head" step (webcam view, an arrow, the instruction): a SLIGHT
+# turn toward that side, like an attention shift, not a full turn. Then two
+# dots: the midpoint toward that side and the edge/corner, e.g. up-left =
 # upper-middle-left and upper-left. Those same points are also in the straight
 # grid, so the model sees each one with and without the head's help, which is
 # what teaches it the head/eye coupling.
-# Nothing checks the head angle: an earlier version waited for a measured turn
-# and learned left/up from the first stage, which subtle movements never
-# reached, so the gauge accepted any direction. The user is trusted to look
-# where the dot is.
+# The turn step is timed, not gated: an earlier version waited for a measured
+# turn and learned left/up from the first stage, which subtle movements never
+# reached, so its gauge accepted any direction. Space starts the dots early.
 LO, NEAR, MID, FAR, HI = (float(v) for v in np.linspace(CAL_MARGIN, 1 - CAL_MARGIN, STRAIGHT_GRID_N))
-HEAD_FOLLOW = "let your head turn slightly with your eyes, as you naturally would"
 HEAD_STAGES = [
-    ("straight", "Keep your head still and follow the dot with your eyes", None),
-    ("up-left", f"Look toward the UPPER LEFT - {HEAD_FOLLOW}", [(NEAR, NEAR), (LO, LO)]),
-    ("up", f"Look toward the TOP - {HEAD_FOLLOW}", [(MID, NEAR), (MID, LO)]),
-    ("up-right", f"Look toward the UPPER RIGHT - {HEAD_FOLLOW}", [(FAR, NEAR), (HI, LO)]),
-    ("right", f"Look toward the RIGHT - {HEAD_FOLLOW}", [(FAR, MID), (HI, MID)]),
-    ("down-right", f"Look toward the LOWER RIGHT - {HEAD_FOLLOW}", [(FAR, FAR), (HI, HI)]),
-    ("down", f"Look toward the BOTTOM - {HEAD_FOLLOW}", [(MID, FAR), (MID, HI)]),
-    ("down-left", f"Look toward the LOWER LEFT - {HEAD_FOLLOW}", [(NEAR, FAR), (LO, HI)]),
-    ("left", f"Look toward the LEFT - {HEAD_FOLLOW}", [(NEAR, MID), (LO, MID)]),
+    ("straight", "", None),
+    ("up-left", "UPPER LEFT", [(NEAR, NEAR), (LO, LO)]),
+    ("up", "TOP", [(MID, NEAR), (MID, LO)]),
+    ("up-right", "UPPER RIGHT", [(FAR, NEAR), (HI, LO)]),
+    ("right", "RIGHT", [(FAR, MID), (HI, MID)]),
+    ("down-right", "LOWER RIGHT", [(FAR, FAR), (HI, HI)]),
+    ("down", "BOTTOM", [(MID, FAR), (MID, HI)]),
+    ("down-left", "LOWER LEFT", [(NEAR, FAR), (LO, HI)]),
+    ("left", "LEFT", [(NEAR, MID), (LO, MID)]),
 ]
-CAL_PREROLL_S = 0.6        # straight stage: the first dot shows this long before capture
+CAL_PREROLL_S = 0.6        # the first dot shows this long before capture
 CAL_SETTLE_S = 0.45        # eyes only: a saccade settles fast
-HEAD_PREROLL_S = 1.5       # directional stage: time to read the instruction
-HEAD_SETTLE_S = 0.8        # the head takes longer than the eyes to settle
+HEAD_TURN_S = 3.0          # "turn your head slightly" step before a directional stage (Space skips ahead)
+HEAD_SETTLE_S = 0.6        # directional stages: a little longer per dot
 CAL_MIN_SAMPLES = 8
 CAL_TARGET_SAMPLES = 12
 CAL_MAX_CAPTURE_S = 2.0
@@ -303,6 +301,25 @@ def _draw_target(canvas, point_px, progress: float, settling: bool) -> None:
     cv2.circle(canvas, (x, y), 26, color, 3, cv2.LINE_AA)
     cv2.circle(canvas, (x, y), max(2, int(20 * progress)), color, -1, cv2.LINE_AA)
     cv2.circle(canvas, (x, y), 3, (0, 0, 0), -1, cv2.LINE_AA)
+
+
+def _draw_turn_prompt(canvas, where: str, dx: int, dy: int, seconds_left: float) -> None:
+    """Big instruction + an arrow from the center toward that side (the view is
+    mirrored, so screen-left is the user's left) + the countdown to the dots."""
+    h, w = canvas.shape[:2]
+    lines = [(f"Turn your head SLIGHTLY toward the {where}", 1.1), ("a small turn, not a full one", 0.8),
+             (f"dots start in {math.ceil(seconds_left)}s", 0.8)]
+    for i, (text, scale) in enumerate(lines):
+        size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 3)[0]
+        org = ((w - size[0]) // 2, 60 + 48 * i)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 6, cv2.LINE_AA)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255) if i == 0 else (240, 240, 240),
+                    3, cv2.LINE_AA)
+    cx, cy = w // 2, h // 2 + 40
+    length = 170 / math.hypot(dx, dy)
+    tip = (int(cx + dx * length), int(cy + dy * length))
+    cv2.arrowedLine(canvas, (cx, cy), tip, (0, 0, 0), 16, cv2.LINE_AA, tipLength=0.3)
+    cv2.arrowedLine(canvas, (cx, cy), tip, (0, 255, 255), 9, cv2.LINE_AA, tipLength=0.3)
 
 
 @dataclass
@@ -573,17 +590,37 @@ def run_calibration(tracker: WebcamGazeTracker, frame_w: int, frame_h: int,
     all_features: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
 
-    for stage_idx, (name, instruction, stage_targets) in enumerate(stages):
+    for stage_idx, (name, where, stage_targets) in enumerate(stages):
         stage_label = f"Stage {stage_idx + 1}/{len(stages)}: {name}   |   S = skip this stage"
         head_follows = stage_targets is not None
         targets = stage_targets if head_follows else grid_targets(STRAIGHT_GRID_N)
         settle_s = HEAD_SETTLE_S if head_follows else CAL_SETTLE_S
+        instruction = (f"Keep your head turned slightly toward the {where}; follow the dots with your eyes"
+                       if head_follows else "Keep your head still and follow the dot with your eyes")
         skipped = False
+
+        # Turn-your-head step: timed, never waits on a measured head angle.
+        if head_follows:
+            dx = -1 if "left" in name else (1 if "right" in name else 0)
+            dy = -1 if "up" in name else (1 if "down" in name else 0)
+            t0 = time.monotonic()
+            while (left := HEAD_TURN_S - (time.monotonic() - t0)) > 0:
+                frame, _, _, _ = tracker.read()
+                canvas = face_canvas(frame)
+                _draw_turn_prompt(canvas, where, dx, dy, left)
+                _draw_status(canvas, stage_label, 52)
+                _draw_status(canvas, "Space = ready now")
+                key = show(canvas)
+                if key == ord("s"):
+                    skipped = True
+                    break
+                if key == ord(" "):
+                    break
 
         # Pre-roll: the first dot (not captured yet) and the instruction.
         fx, fy = int(targets[0][0] * frame_w), int(targets[0][1] * frame_h)
         t0 = time.monotonic()
-        while time.monotonic() - t0 < (HEAD_PREROLL_S if head_follows else CAL_PREROLL_S):
+        while not skipped and time.monotonic() - t0 < CAL_PREROLL_S:
             frame, landmarks, _, _ = tracker.read()
             canvas = eyes_canvas(frame, landmarks)
             _draw_target(canvas, (fx, fy), 0.0, settling=True)
