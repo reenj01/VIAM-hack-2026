@@ -31,7 +31,7 @@ from viam.robot.client import RobotClient
 from viam.services.motion import MotionClient
 from viam.services.vision import VisionClient
 
-from gaze_lock import Box, GazeLockController, filter_background_boxes
+from gaze_lock import Box, filter_background_boxes
 from webcam_gaze import GazeCalibration, GazeEstimator, WebcamGazeTracker, run_calibration
 
 
@@ -43,23 +43,36 @@ API_KEY_ID = os.getenv("API_KEY_ID") or os.getenv("VIAM_API_KEY_ID")
 
 # --- Exact machine resource names ---
 ARM_NAME, GRIPPER_NAME, CAMERA_NAME = "arm", "gripper", "cam"
-DETECTOR_NAME, SEGMENTER_NAME, MOTION_NAME = "vision-1", "objects-3d", "motion"
+DETECTOR_NAME, MOTION_NAME = "vision-1", "motion"
 OBSERVE_JOINTS = [294.952, -60.135, -19.090, 0.009, 79.179, 165.257]
 
-# Geometry values are in millimeters. Tune object height only after a safe hover.
+# Geometry values are in millimeters. Object height is supplied by hand; this
+# script never uses point-cloud segmentation.
 TABLE_SURFACE_Z_MM = -123.0
-ESTIMATED_OBJECT_HEIGHT_MM = 50.0
-GRASP_HEIGHT_OFFSET_MM = 0.0
+DEFAULT_OBJECT_HEIGHT_MM = 100.0
+OBJECT_DIMENSIONS_MM = {
+    # Measured values supplied in inches, converted with 1 in = 25.4 mm.
+    "coke can": {"width": 63.5, "depth": 63.5, "height": 120.65},
+    "cokecan": {"width": 63.5, "depth": 63.5, "height": 120.65},
+    "juicebox": {"width": 63.5, "depth": 60.325, "height": 152.4},
+    "juice box": {"width": 63.5, "depth": 60.325, "height": 152.4},
+    "black block": {"width": 28.575, "depth": 28.575, "height": 60.325},
+    "blackblock": {"width": 28.575, "depth": 28.575, "height": 60.325},
+}
+GRASP_HEIGHT_FRACTION = 0.60
 APPROACH_STANDOFF_MM = 120.0
 LIFT_MM = 120.0
+MIN_TARGET_RADIUS_MM = 200.0
+MAX_TARGET_RADIUS_MM = 600.0
 
 SCENE_REFRESH_SECONDS = 0.30
 GAZE_DWELL_SECONDS = 2.0
 WEBCAM_INDEX = 0
 WINDOW = "Gaze pick — G confirms | C recalibrate | Q quits"
-EXECUTE = "--execute" in sys.argv
-DRY_RUN = not EXECUTE
+# Real pick motions run after the G confirmation. Use --dry-run for testing.
+DRY_RUN = "--dry-run" in sys.argv
 SKIP_CALIBRATION = "--skip-calibration" in sys.argv
+MOVE_TO_OBSERVE = "--observe" in sys.argv
 
 
 async def connect() -> RobotClient:
@@ -171,6 +184,60 @@ class RobotFeed:
             await asyncio.gather(self._task, return_exceptions=True)
 
 
+class DirectBoxDwell:
+    """Select only when the gaze remains inside one actual detection box.
+
+    Unlike the old soft-evidence selector, nearby boxes cannot steal enough
+    score to prevent a selection. Brief missed detections and blinks preserve
+    the timer; looking outside the box for longer resets it.
+    """
+
+    def __init__(self, dwell_seconds: float, grace_seconds: float = 0.35):
+        self.dwell_seconds, self.grace_seconds = dwell_seconds, grace_seconds
+        self.box: Optional[Box] = None
+        self.elapsed = 0.0
+        self.last_tick: Optional[float] = None
+        self.last_hit: Optional[float] = None
+
+    def reset(self) -> None:
+        self.box, self.elapsed, self.last_tick, self.last_hit = None, 0.0, None, None
+
+    def hold(self) -> None:
+        """Pause time during a blink, rather than counting it as attention."""
+        if self.box is not None:
+            self.last_tick = time.monotonic()
+
+    @staticmethod
+    def _same_object(old: Box, new: Box) -> bool:
+        if old.label != new.label:
+            return False
+        ix0, iy0 = max(old.x0, new.x0), max(old.y0, new.y0)
+        ix1, iy1 = min(old.x1, new.x1), min(old.y1, new.y1)
+        intersection = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+        union = old.area + new.area - intersection
+        return union > 0 and intersection / union >= 0.25
+
+    def update(self, boxes: list[Box], gaze_image: Optional[tuple[float, float]]):
+        now = time.monotonic()
+        hit = None
+        if gaze_image is not None:
+            inside = [box for box in boxes if box.contains(*gaze_image)]
+            hit = min(inside, key=lambda box: box.area) if inside else None
+        if hit is None:
+            if self.box is not None and self.last_hit is not None and now - self.last_hit <= self.grace_seconds:
+                self.last_tick = now
+                return self.box, min(1.0, self.elapsed / self.dwell_seconds), None
+            self.reset()
+            return None, 0.0, None
+        if self.box is None or not self._same_object(self.box, hit):
+            self.box, self.elapsed, self.last_tick, self.last_hit = hit, 0.0, now, now
+            return hit, 0.0, None
+        self.elapsed += min(0.15, now - (self.last_tick or now))
+        self.box, self.last_tick, self.last_hit = hit, now, now
+        progress = min(1.0, self.elapsed / self.dwell_seconds)
+        return hit, progress, hit if progress >= 1.0 else None
+
+
 def draw_scene(obs: Observation, transform: DisplayTransform, gaze: Optional[tuple[float, float]],
                leader: Optional[Box], progress: float) -> np.ndarray:
     canvas = transform.render(obs.frame)
@@ -218,50 +285,44 @@ async def transformed(robot: RobotClient, pose: Pose, source: str, destination: 
     return (await robot.transform_pose(PoseInFrame(reference_frame=source, pose=pose), destination)).pose
 
 
-def segment_label(segment) -> str:
-    return next((g.label for g in segment.geometries.geometries if g.label), "")
+def dimensions_for(label: str) -> dict[str, float]:
+    normalized = label.casefold().replace("_", " ").replace("-", " ")
+    dimensions = OBJECT_DIMENSIONS_MM.get(normalized)
+    if dimensions is None:
+        print(f"[pick] WARNING: no manual dimensions for {label!r}; using default "
+              f"height {DEFAULT_OBJECT_HEIGHT_MM:.0f} mm")
+        return {"width": 60.0, "depth": 60.0, "height": DEFAULT_OBJECT_HEIGHT_MM}
+    return dimensions
 
 
-def project(point: Pose, intr: Intrinsics, image_w: int, image_h: int) -> Optional[tuple[float, float]]:
-    # Geometry.center is millimeters. Raw point-cloud bytes are meters, but we
-    # deliberately never use them, avoiding a 1000x coordinate conversion bug.
-    if point.z <= 0:
-        return None
-    return ((intr.fx * point.x / point.z + intr.cx) * image_w / intr.width,
-            (intr.fy * point.y / point.z + intr.cy) * image_h / intr.height)
-
-
-async def matching_segment(robot: RobotClient, segmenter: VisionClient, selected: Box,
-                           intr: Optional[Intrinsics], image_w: int, image_h: int):
-    """GetObjectPointClouds, match label, then projected center if repeated."""
-    segments = await segmenter.get_object_point_clouds(CAMERA_NAME, timeout=90)
-    candidates = [s for s in segments if s.geometries.geometries and segment_label(s) == selected.label]
-    if not candidates:
-        labels = sorted({segment_label(s) for s in segments if segment_label(s)})
-        raise RuntimeError(f"no 3-D segment for {selected.label!r}; got {labels or 'none'}")
-    if len(candidates) == 1:
-        return candidates[0]
-    if intr is None:
-        raise RuntimeError(f"cannot distinguish {len(candidates)} {selected.label!r} segments without intrinsics")
-    cx, cy = (selected.x0 + selected.x1) / 2, (selected.y0 + selected.y1) / 2
-    matches = []
-    for segment in candidates:
-        geometry = segment.geometries.geometries[0]
-        in_camera = await transformed(robot, geometry.center, segment.geometries.reference_frame or ARM_NAME, CAMERA_NAME)
-        pixel = project(in_camera, intr, image_w, image_h)
-        if pixel and selected.x0 <= pixel[0] <= selected.x1 and selected.y0 <= pixel[1] <= selected.y1:
-            matches.append((np.hypot(pixel[0] - cx, pixel[1] - cy), segment))
-    if not matches:
-        raise RuntimeError("no repeated-label 3-D center projected into the selected box")
-    return min(matches, key=lambda pair: pair[0])[1]
+async def bottom_center_on_table(robot: RobotClient, selected: Box, intr: Intrinsics,
+                                 image_w: int, image_h: int) -> tuple[float, float, tuple[float, float]]:
+    """Back-project a box bottom-center and intersect its world ray with table Z."""
+    pixel = ((selected.x0 + selected.x1) / 2, float(selected.y1))
+    u, v = pixel[0] * intr.width / image_w, pixel[1] * intr.height / image_h
+    ray_x, ray_y = (u - intr.cx) / intr.fx, (v - intr.cy) / intr.fy
+    origin = await transformed(robot, Pose(x=0, y=0, z=0, o_z=1), CAMERA_NAME, "world")
+    far = await transformed(robot, Pose(x=ray_x * 1000, y=ray_y * 1000, z=1000, o_z=1), CAMERA_NAME, "world")
+    dx, dy, dz = far.x - origin.x, far.y - origin.y, far.z - origin.z
+    if abs(dz) < 1e-6:
+        raise RuntimeError("camera ray is parallel to the table plane")
+    distance = (TABLE_SURFACE_Z_MM - origin.z) / dz
+    if distance <= 0:
+        raise RuntimeError("table-plane intersection is behind cam; check cam frame orientation")
+    return origin.x + distance * dx, origin.y + distance * dy, pixel
 
 
 def top_down(x: float, y: float, z: float) -> Pose:
     return Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=0)
 
 
+def tilted_top_down(x: float, y: float, z: float) -> Pose:
+    """15-degree pitch fallback for a strict top-down self-collision."""
+    return Pose(x=x, y=y, z=z, o_x=0, o_y=1, o_z=0, theta=15)
+
+
 async def arm_stop(arm: Arm) -> None:
-    if EXECUTE:
+    if not DRY_RUN:
         try:
             await asyncio.wait_for(arm.stop(), timeout=2)
         except Exception as exc:
@@ -269,22 +330,27 @@ async def arm_stop(arm: Arm) -> None:
 
 
 async def move(motion: MotionClient, target: Pose, label: str, linear: bool = False) -> bool:
-    destination = PoseInFrame(reference_frame=ARM_NAME, pose=target)
-    print(f"[pick] {'DRY RUN: would ' if DRY_RUN else ''}{label}: arm ({target.x:.1f}, {target.y:.1f}, {target.z:.1f})")
+    destination = PoseInFrame(reference_frame="world", pose=target)
+    print(f"[pick] {'DRY RUN: would ' if DRY_RUN else ''}{label}: world "
+          f"({target.x:.1f}, {target.y:.1f}, {target.z:.1f}), "
+          f"o=({target.o_x:.2f},{target.o_y:.2f},{target.o_z:.2f},{target.theta:.1f})")
     if DRY_RUN:
         await asyncio.sleep(0.2)
         return True
     constraints = Constraints(linear_constraint=[LinearConstraint()]) if linear else None
     try:
         ok = await motion.move(component_name=GRIPPER_NAME, destination=destination, constraints=constraints)
+        print(f"[pick] {label} result: {ok}")
     except Exception as exc:
         if not linear:
             raise
         print(f"[pick] linear {label} infeasible ({exc}); retrying free")
         ok = await motion.move(component_name=GRIPPER_NAME, destination=destination)
+        print(f"[pick] free retry {label} result: {ok}")
     if not ok and linear:
         print(f"[pick] linear {label} returned false; retrying free")
         ok = await motion.move(component_name=GRIPPER_NAME, destination=destination)
+        print(f"[pick] free retry {label} result: {ok}")
     return bool(ok)
 
 
@@ -293,30 +359,45 @@ class PickJob:
         self.status, self.task, self.done, self.success = "waiting", None, False, False
 
 
-async def pick(robot: RobotClient, segmenter: VisionClient, motion: MotionClient, gripper: Gripper,
+async def pick(robot: RobotClient, motion: MotionClient, gripper: Gripper,
                selected: Box, intr: Optional[Intrinsics], image_w: int, image_h: int, job: PickJob) -> None:
     try:
-        job.status = f"matching 3-D {selected.label}"
-        segment = await matching_segment(robot, segmenter, selected, intr, image_w, image_h)
-        geometry = segment.geometries.geometries[0]
-        center = await transformed(robot, geometry.center, segment.geometries.reference_frame or ARM_NAME, ARM_NAME)
-        print(f"[3d] {selected.label}: center in arm frame = ({center.x:.1f}, {center.y:.1f}, {center.z:.1f}) mm")
-        # Never use the inflated segment center z for the grasp plane.
-        grasp_z = TABLE_SURFACE_Z_MM + ESTIMATED_OBJECT_HEIGHT_MM + GRASP_HEIGHT_OFFSET_MM
+        if intr is None:
+            raise RuntimeError("cam intrinsics unavailable; cannot calculate a table-plane intersection")
+        job.status = f"locating {selected.label} on table"
+        x, y, pixel = await bottom_center_on_table(robot, selected, intr, image_w, image_h)
+        radius = (x * x + y * y) ** 0.5
+        print(f"[pick] selected label: {selected.label!r}; bottom-center pixel=({pixel[0]:.1f}, {pixel[1]:.1f})")
+        print(f"[pick] table-plane world position: x={x:.1f} y={y:.1f} mm; radius={radius:.1f} mm")
+        if not MIN_TARGET_RADIUS_MM <= radius <= MAX_TARGET_RADIUS_MM:
+            raise RuntimeError(f"target radius {radius:.1f} mm is outside safe {MIN_TARGET_RADIUS_MM:.0f}-"
+                               f"{MAX_TARGET_RADIUS_MM:.0f} mm workspace; no motion sent")
+        dims = dimensions_for(selected.label)
+        grasp_z = TABLE_SURFACE_Z_MM + dims["height"] * GRASP_HEIGHT_FRACTION
+        print(f"[pick] manual dimensions={dims}; grasp z={grasp_z:.1f} mm")
         if not DRY_RUN:
             job.status = "opening gripper"
             await gripper.open()
         job.status = "approaching"
-        if not await move(motion, top_down(center.x, center.y, grasp_z + APPROACH_STANDOFF_MM), "free standoff"):
-            raise RuntimeError("approach rejected")
+        pose = top_down
+        try:
+            if not await move(motion, pose(x, y, grasp_z + APPROACH_STANDOFF_MM), "free standoff"):
+                raise RuntimeError("approach rejected")
+        except Exception as exc:
+            if "self-collision" not in str(exc).casefold():
+                raise
+            print("[pick] strict top-down self-collided; retrying once with a 15-degree tilted approach")
+            pose = tilted_top_down
+            if not await move(motion, pose(x, y, grasp_z + APPROACH_STANDOFF_MM), "tilted free standoff"):
+                raise RuntimeError("tilted approach rejected")
         job.status = "descending"
-        if not await move(motion, top_down(center.x, center.y, grasp_z), "linear descent", linear=True):
+        if not await move(motion, pose(x, y, grasp_z), "linear descent", linear=True):
             raise RuntimeError("descent rejected")
         job.status = "grabbing"
         if not DRY_RUN:
             await gripper.grab()
         job.status = "lifting"
-        if not await move(motion, top_down(center.x, center.y, grasp_z + LIFT_MM), "linear lift", linear=True):
+        if not await move(motion, pose(x, y, grasp_z + LIFT_MM), "linear lift", linear=True):
             raise RuntimeError("lift rejected")
         job.status, job.success = f"lifted {selected.label}", True
     except asyncio.CancelledError:
@@ -359,23 +440,25 @@ async def main() -> None:
     camera = Camera.from_robot(machine, CAMERA_NAME)
     gripper = Gripper.from_robot(machine, GRIPPER_NAME)
     detector = VisionClient.from_robot(machine, DETECTOR_NAME)
-    segmenter = VisionClient.from_robot(machine, SEGMENTER_NAME)
     motion = MotionClient.from_robot(machine, MOTION_NAME)
     feed, gaze, job = RobotFeed(camera, detector), WebcamGazeTracker(WEBCAM_INDEX), None
     try:
-        print("[main] " + ("EXECUTE: E-stop must be reachable" if EXECUTE else "DRY RUN: no arm commands"))
-        if DRY_RUN:
-            print(f"[main] DRY RUN: observe joints {OBSERVE_JOINTS}")
-        else:
+        print("[main] " + ("DRY RUN: no arm commands" if DRY_RUN else
+                           "LIVE MOTION: E-stop must be reachable"))
+        if MOVE_TO_OBSERVE and DRY_RUN:
+            print(f"[main] DRY RUN: would move to observe joints {OBSERVE_JOINTS}")
+        elif MOVE_TO_OBSERVE:
             await arm.move_to_joint_positions(JointPositions(values=OBSERVE_JOINTS))
             await asyncio.sleep(1.0)
+        else:
+            print("[main] using the arm's current pose; it will not move to the saved observe pose")
         first = await feed.first()
         image_h, image_w = first.frame.shape[:2]
         transform = DisplayTransform.fit(image_w, image_h, image_w, image_h)
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         estimator = GazeEstimator(gaze, calibration(gaze, transform.window_w, transform.window_h))
-        selector = GazeLockController(select_seconds=GAZE_DWELL_SECONDS)
+        dwell = DirectBoxDwell(dwell_seconds=GAZE_DWELL_SECONDS)
         intr = await get_intrinsics(camera)
         feed.start()
         pending, snapshot = None, None
@@ -394,7 +477,7 @@ async def main() -> None:
                     if key == ord("r"):
                         print(f"[pick] clearing result: {job.status}")
                         job, pending, snapshot = None, None, None
-                        selector.release(); feed.paused = False
+                        dwell.reset(); feed.paused = False
                 await asyncio.sleep(.02)
                 continue
             if pending is not None:
@@ -403,10 +486,10 @@ async def main() -> None:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     pending, snapshot = None, None
-                    selector.release(); feed.paused = False
+                    dwell.reset(); feed.paused = False
                 elif key == ord("g"):
                     job = PickJob()
-                    job.task = asyncio.create_task(pick(machine, segmenter, motion, gripper, pending, intr, image_w, image_h, job))
+                    job.task = asyncio.create_task(pick(machine, motion, gripper, pending, intr, image_w, image_h, job))
                 await asyncio.sleep(.02)
                 continue
             obs = feed.latest
@@ -416,11 +499,11 @@ async def main() -> None:
             # Inverse transform is deliberate: hit tests always use image-space boxes.
             gaze_image = transform.window_to_image(*gaze_window) if gaze_window else None
             if blinking:
-                selector.hold(); leader, progress, locked = None, 0.0, None
+                dwell.hold(); leader, progress, locked = dwell.box, 0.0, None
             else:
-                leader, progress, locked = selector.update(obs.frame, obs.boxes, gaze_image)
+                leader, progress, locked = dwell.update(obs.boxes, gaze_image)
             if locked:
-                pending, snapshot = locked.box, locked.snapshot
+                pending, snapshot = locked, obs.frame.copy()
                 feed.paused = True
                 print(f"[gaze] selected {pending.label!r}; press G to confirm")
                 continue
@@ -429,12 +512,15 @@ async def main() -> None:
                 cv2.putText(view, "No objects detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, .85, (0, 180, 255), 2)
             elif gaze_window is None:
                 cv2.putText(view, "No face detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, .85, (0, 180, 255), 2)
+            elif leader is not None:
+                cv2.putText(view, f"Looking at {leader.label}: {progress:.1f}/{GAZE_DWELL_SECONDS:.1f}s",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, .75, (0, 255, 255), 2)
             cv2.imshow(WINDOW, view)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"): break
             if key == ord("c"):
                 estimator = GazeEstimator(gaze, calibration(gaze, transform.window_w, transform.window_h))
-                selector.release()
+                dwell.reset()
     finally:
         if job and job.task and not job.task.done():
             job.task.cancel(); await asyncio.gather(job.task, return_exceptions=True)
